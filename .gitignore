@@ -1,0 +1,107 @@
+# ===========================================================================
+# Tulpar Engine — yok sayilanlar
+# Kural: turetilmis her sey disarida. Ozellikle testlerin CALISMA DIZININE
+# biraktigi artefaktlar: depoya girerlerse bir sonraki kosuda "kanonik dosya"
+# gibi okunup kapilari sessizce yesile cevirirler.
+# ===========================================================================
+
+# ==== Derleme dizinleri ====
+# `yapi/` bu deponun varsayilan adi (README); `build*` glob'u CMake'in ve
+# araclarin urettigi butun varyantlari (build-linux, build-android,
+# build-android-x86_64, build-linux-tracy, ...) kapsar.
+yapi/
+build/
+build*/
+cmake-build-*/
+
+# ==== CMake artiklari (kaynak icinde yapilandirma kazasi) ====
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# ==== Derleyici/baglayici ciktilari ====
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+
+# ==== Kare ciktilari ve kabuk goruntuleri ====
+# engine_demo/engine_editor/engine_tests --headless --out x.ppm ile PPM yaziyor;
+# tools/ppm2png.py bunlari PNG'ye ceviriyor. Ikisi de turetilmis.
+*.ppm
+/*.png
+!assets/**/*.png
+!tests/assets/**/*.png
+!third_party/**/*.png
+
+# ==== Shader ara ciktilari ====
+# tools/compile_shaders.py DEPOYA GIREN `*_spv.h` dizileri uretir (onlar kaynak);
+# ham `.spv` ve glslc/spirv araclarinin gecici ciktilari degil.
+*.spv
+*.spvasm
+
+# ==== Sahne derleyicisi ====
+# `.sahne` kaynak, `.sahneb` blob turetilmis ve belirlenimli (engine_sahnec / editor Derle).
+*.sahneb
+
+# ==== Test/editor artefaktlari (calisma dizinine yazilir) ====
+# Editorun duzen kapilari sahne dizinine yaziyor — yani `tests/assets/` altina.
+.duzen_kapisi*.duzen
+*.kurtarma.json
+tulpar_kayit.txt
+# platform/crash.cpp cokme raporu (pozitif kontrol testi bilerek cokuyor)
+crash_*.txt
+# content/importer.hpp derleme onbellegi: girdinin ozeti + damga dosyalari.
+# Depoya girerse bayatladiginda kapilari sessizce "atlandi"ya dusurur.
+.tulpar_onbellek/
+# Tracy yakalamalari (tools/tracy_check.sh)
+*.tracy
+
+# ==== Indirilen (vendored DEGIL) ucuncu taraf ikilileri ====
+# tools/fetch_vvl_android.sh — Khronos dogrulama katmani Android ikilileri
+third_party/vvl-android/
+# tools/fetch_swappy.sh — AGDK kare temposu statik kutuphaneleri (include/ kaynak)
+third_party/swappy/libs/
+
+# ==== Android paketleme ====
+android/dist/
+*_apk/
+*.apk
+*.apk.idsig
+*.keystore
+
+# ==== Kayitlar ve gecici dosyalar ====
+*.log
+*.tmp
+*~
+*.bak
+
+# ==== IDE / editor ====
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*.code-workspace
+.cache/
+.clangd/
+
+# ==== Isletim sistemi ====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==== Python ====
+__pycache__/
+*.py[cod]
+
+# ==== Yerel ajan/arac durumu ====
+.claude/

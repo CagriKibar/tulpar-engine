@@ -1,0 +1,231 @@
+# ===========================================================================
+# Tulpar Engine — CI
+#
+# Kural (projenin kendi kurali): KOSMAYAN KAPI YESIL DEGILDIR.
+# engine_tests donanim/arac yoksa sessizce gecmez, "ATLANDI: <sebep>" basar ve
+# ozet satirindaki sayaca girer. Bu yuzden is akisi ozet satirini PARSE eder:
+#   - ozet satiri hic yoksa   -> KIRMIZI (cokme/asilma "0 failed" gibi okunamaz)
+#   - kosan != kayitli        -> KIRMIZI (kayit tasmasi: test hic kosmamis olur)
+#   - failed > 0              -> KIRMIZI
+#   - atlanan kapilarin sebepleri is ozetine YAZILIR (gorunmeden kalmasin)
+# Ubuntu'da lavapipe kurulur, yani Vulkan yolunun gercekten kosmasi BEKLENIR:
+# "Vulkan ... yok" gerekceli tek bir atlama bile isi kirmiziya cevirir.
+# `continue-on-error` YOK; hicbir adim yumusatilmaz.
+# ===========================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux x86_64 (GCC + lavapipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # mesa-vulkan-drivers = lavapipe ICD (yazilim Vulkan). libvulkan1 = loader;
+      # motor onu link zamaninda degil dlopen ile ariyor, yani paket yoksa butun
+      # GPU kapilari atlanir ve "passed" sayisi GPU hakkinda hicbir sey soylemez.
+      - name: Bagimliliklar (lavapipe dahil)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build cmake g++ python3 libvulkan1 mesa-vulkan-drivers vulkan-tools
+
+      - name: Vulkan surucusu gercekten var mi
+        run: vulkaninfo --summary
+
+      # Katman kurali mekaniktir: ihlal = derleme hatasi (engine_core'un on kosulu).
+      # Derlemeden once ayrica acikca kosuyoruz ki mesaj derleyici ciktisinda kaybolmasin.
+      - name: Katman denetimi
+        run: python3 tools/layer_check.py .
+
+      - name: Yapilandir
+        run: cmake -S . -B yapi -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Derle
+        run: cmake --build yapi -j"$(nproc)"
+
+      # Kapinin POZITIF KONTROLU: Vulkan'i kapatip atlama satirlarinin GERCEKTEN
+      # basildigini goruyoruz. Boylece asagidaki Vulkan kontrolunun hicbir seye
+      # uymayan bos bir grep olmadigi kanitlanmis oluyor.
+      - name: Atlama mekanizmasinin pozitif kontrolu
+        run: |
+          set -uo pipefail
+          TULPAR_ENGINE_NO_VULKAN=1 ./yapi/engine_tests rhi_ > kontrol.log 2>&1 || true
+          # Asagidaki kapiyla AYNI ifade — kontrol ettigi sey de tam olarak o.
+          n=$(grep -E 'ATLANDI:.*Vulkan' kontrol.log | grep -cv 'tukendi')
+          if [ "$n" -eq 0 ]; then
+            echo "::error::Pozitif kontrol basarisiz: TULPAR_ENGINE_NO_VULKAN=1 ile bile Vulkan atlama satiri basilmadi. Asagidaki Vulkan kapisi bos bir grep olurdu."
+            tail -40 kontrol.log
+            exit 1
+          fi
+          echo "Pozitif kontrol tamam: $n atlama satiri uretildi."
+
+      - name: Testler + kapi
+        run: |
+          set -uo pipefail
+          ./yapi/engine_tests 2>&1 | tee sonuc.log
+          kod=${PIPESTATUS[0]}
+
+          ozet="$(grep -E '^engine tests: [0-9]+ passed' sonuc.log | tail -1 || true)"
+          if [ -z "$ozet" ]; then
+            echo "::error::Ozet satiri YOK — engine_tests cokmus ya da asilmis olabilir."
+            exit 1
+          fi
+          echo "$ozet"
+
+          gecen=$(sed -E 's/^engine tests: ([0-9]+) passed.*/\1/'   <<< "$ozet")
+          kalan=$(sed -E 's/.*, ([0-9]+) failed.*/\1/'              <<< "$ozet")
+          atlanan=$(sed -E 's/.*, ([0-9]+) atlandi.*/\1/'           <<< "$ozet")
+          kosan=$(sed -E 's/.*\(([0-9]+)\/[0-9]+ kosuldu\).*/\1/'   <<< "$ozet")
+          kayitli=$(sed -E 's/.*\([0-9]+\/([0-9]+) kosuldu\).*/\1/' <<< "$ozet")
+
+          {
+            echo "### Linux (lavapipe)"
+            echo ""
+            echo "\`$ozet\`"
+            echo ""
+            if [ "$atlanan" -gt 0 ]; then
+              echo "<details><summary>Atlanan $atlanan kapi</summary>"
+              echo ""
+              echo '```'
+              grep -E 'ATLANDI:' sonuc.log | sort | uniq -c | sort -rn
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if grep -q 'KAYIT TASMASI' sonuc.log; then
+            echo "::error::Kayit tasmasi: bazi testler HIC kosmadi (tests/test.hpp icindeki Registry::kMax)."
+            exit 1
+          fi
+          if [ "$kosan" != "$kayitli" ]; then
+            echo "::error::Kayitli $kayitli testin yalnizca $kosan tanesi kosmus."
+            exit 1
+          fi
+          if [ "$kalan" != "0" ] || [ "$gecen" -le 0 ]; then
+            echo "::error::$kalan test kirmizi."
+            exit 1
+          fi
+
+          # Ubuntu'da lavapipe KURULU. Yani Vulkan yolunun atlanmasi bir cevre
+          # sorunu degil, is akisinin kendi arizasidir: sessizce yesil gecmesin.
+          # "Vulkan tukendi" haric: o loader/ICD yoklugu degil, ayni surecte cok
+          # fazla cihaz acilmasi (kaynak tavani) — baska bir ariza sinifi.
+          vulkan_atlama="$(grep -E 'ATLANDI:.*Vulkan' sonuc.log | grep -v 'tukendi' || true)"
+          if [ -n "$vulkan_atlama" ]; then
+            echo "$vulkan_atlama"
+            echo "::error::Lavapipe kurulu oldugu halde Vulkan kapilari atlandi — loader/ICD gelmemis. 'passed' sayisi GPU yolu hakkinda hicbir sey soylemiyor."
+            exit 1
+          fi
+
+          exit "$kod"
+
+  windows:
+    name: Windows x86_64 (MSYS2 MINGW64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      # Satir sonlari .gitattributes ile LF'e sabitli (kanonik .sahne bayt-esitlik
+      # kapisi bunu sart kosuyor); autocrlf'i ayrica kapatiyoruz ki runner ayari
+      # .gitattributes'tan once devreye girmesin.
+      - name: Satir sonu ayari
+        shell: bash
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-python
+
+      # Olculdu (2026-09-19): core.autocrlf=true olan bir makinede taze klon bu
+      # dosyayi CRLF'e ceviriyor, yazici LF uretiyor ve kanonik kapi kodda hicbir
+      # hata yokken kirmizi doniyordu. Kapinin kapisi.
+      - name: Kanonik varliklar LF mi
+        run: python3 -c "import sys; d=open('tests/assets/editor.sahne','rb').read(); sys.exit(0 if b'\r' not in d else 1)" || { echo "::error::tests/assets/editor.sahne CRLF ile cikarilmis; .gitattributes devreye girmemis."; exit 1; }
+
+      - name: Katman denetimi
+        run: python3 tools/layer_check.py .
+
+      - name: Yapilandir
+        run: cmake -S . -B yapi -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Derle
+        run: cmake --build yapi -j"$(nproc)"
+
+      # Windows runner'inda yazilim Vulkan ICD'si yok; RHI kapilari burada
+      # ATLANDI olacak ve bu BEKLENEN durum. Ama gorunmez kalmasin: sebepler
+      # is ozetine yazilir. Gercek Vulkan kapisi Linux isinde.
+      - name: Testler + kapi
+        run: |
+          set -uo pipefail
+          ./yapi/engine_tests.exe 2>&1 | tee sonuc.log
+          kod=${PIPESTATUS[0]}
+
+          ozet="$(grep -E '^engine tests: [0-9]+ passed' sonuc.log | tail -1 || true)"
+          if [ -z "$ozet" ]; then
+            echo "::error::Ozet satiri YOK — engine_tests cokmus ya da asilmis olabilir."
+            exit 1
+          fi
+          echo "$ozet"
+
+          gecen=$(sed -E 's/^engine tests: ([0-9]+) passed.*/\1/'   <<< "$ozet")
+          kalan=$(sed -E 's/.*, ([0-9]+) failed.*/\1/'              <<< "$ozet")
+          atlanan=$(sed -E 's/.*, ([0-9]+) atlandi.*/\1/'           <<< "$ozet")
+          kosan=$(sed -E 's/.*\(([0-9]+)\/[0-9]+ kosuldu\).*/\1/'   <<< "$ozet")
+          kayitli=$(sed -E 's/.*\([0-9]+\/([0-9]+) kosuldu\).*/\1/' <<< "$ozet")
+
+          {
+            echo "### Windows (MSYS2 MINGW64)"
+            echo ""
+            echo "\`$ozet\`"
+            echo ""
+            echo "Vulkan ICD'si yok: GPU kapilari burada atlanir, olculdukleri yer Linux isi."
+            echo ""
+            if [ "$atlanan" -gt 0 ]; then
+              echo "<details><summary>Atlanan $atlanan kapi</summary>"
+              echo ""
+              echo '```'
+              grep -E 'ATLANDI:' sonuc.log | sort | uniq -c | sort -rn
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if grep -q 'KAYIT TASMASI' sonuc.log; then
+            echo "::error::Kayit tasmasi: bazi testler HIC kosmadi (tests/test.hpp icindeki Registry::kMax)."
+            exit 1
+          fi
+          if [ "$kosan" != "$kayitli" ]; then
+            echo "::error::Kayitli $kayitli testin yalnizca $kosan tanesi kosmus."
+            exit 1
+          fi
+          if [ "$kalan" != "0" ] || [ "$gecen" -le 0 ]; then
+            echo "::error::$kalan test kirmizi."
+            exit 1
+          fi
+
+          exit "$kod"

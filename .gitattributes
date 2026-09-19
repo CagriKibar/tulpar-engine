@@ -1,0 +1,43 @@
+# ===========================================================================
+# Tulpar Engine — satir sonu ve ikili dosya kurallari
+#
+# NEDEN BU DOSYA VAR: bu depo TulparLang'a **submodule** olarak bagli, ve git
+# UST deponun .gitattributes'ini submodule'un calisma agacina UYGULAMAZ. Ana
+# depoda ayni kural yazili olsa bile submodule klonu onu miras almaz; kurallar
+# submodule sinirini gecmez. Bu yuzden motoru ilgilendiren her kural burada
+# bir kez daha, kendi gerekcesiyle duruyor.
+# ===========================================================================
+
+# Varsayilan: depo LF saklar, LF cikarir. Metin/ikili ayrimini git sezer.
+* text=auto eol=lf
+
+# `.sahne` = sahne editorunun BELIRLENIMLI metin bicimi. Motor onu her zaman
+# LF ile yazar ve `scene_file_editor_sahne_is_canonical` kapisi dosyayi
+# yazicinin ciktisiyla BAYT BAYT karsilastirir. core.autocrlf=true olan bir
+# Windows checkout'unda LF->CRLF cevriliyor ve kapi dusuyor: olculdu
+# 2026-09-19 (MSYS2), tests/assets/editor.sahne 1054 bayt (CRLF, 60 satir)
+# ama yazici 994 bayt (LF) uretiyor — tam 60 bayt fark, satir basina bir CR.
+# Belirti "kanonik bicim bozulmus" diyor, oysa bozulan yalniz checkout.
+*.sahne      text eol=lf
+
+# Kabuk betikleri: CRLF shebang'i bozar (`#!/bin/bash\r` -> "required file not found").
+*.sh         text eol=lf
+
+# Ayni bayt-esitlik sinifi: shader ornekleri ve test varliklari kapilarda
+# ozet/bayt sayisiyla karsilastiriliyor.
+*.tprs       text eol=lf
+*.gltf       text eol=lf
+
+# Ikili varliklar: git'in sezgisine birakilmasin.
+*.png   binary
+*.ttf   binary
+*.ktx2  binary
+*.spv   binary
+*.a     binary
+*.so    binary
+*.dll   binary
+*.exe   binary
+
+# Vendored ucuncu taraf: dokunulmaz. Normallestirme kapali ki `git add` upstream
+# dosyalarda (orn. third_party/recast/LICENSE, CRLF ile gelmis) sahte fark uretmesin.
+third_party/** -text
