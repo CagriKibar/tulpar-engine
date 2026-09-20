@@ -378,7 +378,7 @@ struct EditorState {
   uint32_t water_hash[content::kSceneMaxEntities] = {};
   // Malzemeler ACILISTA kurulur. create_material kare icinde cagrilirsa
   // "kare basina 0 ayirma" kapisi duser (scene_runtime.cpp ayni notu tasiyor).
-  renderer::MaterialHandle terrain_mat{}, voxel_mat{}, water_mat{}, sun_mat{}, light_core_mat{};
+  renderer::MaterialHandle terrain_mat{}, voxel_mat{}, water_mat{}, sun_mat{}, light_core_mat{}, beam_mat{};
   // Prosedurel uretimin GECICI alani: her uretimde mark/reset_to ile geri
   // sarilir. Motorun tek bellek kaynagi arena -- std::malloc DEGIL (AllocGate
   // global ayirmalari sayiyor). Ana `sys` arenasi DOGRUDAN kullanilamaz:
@@ -793,6 +793,10 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
     core_p.metallic = 0.0f; core_p.roughness = 1.0f;
     core_p.emissive = Vec3{28.0f, 25.0f, 20.0f}; // Nokta/Spot isik cekirdegi
     st.light_core_mat = ren.create_material(ren.default_texture(), Vec3{1, 1, 1}, core_p);
+    renderer::PbrParams beam_p;
+    beam_p.metallic = 0.0f; beam_p.roughness = 1.0f;
+    beam_p.emissive = Vec3{8.0f, 7.5f, 6.0f}; // Hacimsel isik huzmesi / fake godray
+    st.beam_mat = ren.create_material(ren.default_texture(), Vec3{1, 1, 1}, beam_p);
   }
   const char *adir = std::getenv("TULPAR_ENGINE_ASSETS");
   if (opts.scene_path) std::snprintf(st.scene_path, sizeof st.scene_path, "%s", opts.scene_path);
@@ -1324,14 +1328,18 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         st.scene.godrays_enabled = true;
         st.dirty = true;
         break;
-      case 64: // Işık Hüzmesi (God Ray Shafts)
+      case 64: // Işık Hüzmesi (Volumetric Fake Godray Beam)
         e.components = content::kSceneLight;
-        e.light_type = content::SceneLightType::Directional;
-        e.light_color = Vec3{1.0f, 0.92f, 0.78f};
-        e.light_intensity = 4.0f;
+        e.light_type = content::SceneLightType::Spot;
+        e.light_color = Vec3{1.0f, 0.94f, 0.82f};
+        e.light_intensity = 6.0f;
+        e.light_radius = 14.0f;
+        e.light_spot_inner = 12.0f;
+        e.light_spot_outer = 26.0f;
         e.light_godray = true;
         e.light_godray_intensity = 2.0f;
-        e.rot_deg = Vec3{30.0f, -30.0f, 0.0f};
+        e.pos = Vec3{0.0f, 4.0f, 0.0f};
+        e.rot_deg = Vec3{60.0f, -25.0f, 0.0f};
         std::snprintf(e.name, sizeof e.name, "isik_huzmesi");
         st.scene.godrays_enabled = true;
         st.scene.godray_density = 1.0f;
@@ -2530,92 +2538,10 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       }
 
       if (ImGui::BeginPopup("SahnePanelMenu")) {
-        // --- 1. YENİ VARLIK EKLE ---
+        // --- 1. YENİ VARLIK EKLE (Tek doğruluk kaynağı: kCreateMenu) ---
         if (ImGui::BeginMenu(ICON_MD_ADD "  Yeni Varl\xC4\xB1k Ekle...")) {
-          if (ImGui::MenuItem("\xE2\x97\x8B  Bo\xC5\x9F Varl\xC4\xB1k")) do_add(1);
-          if (ImGui::MenuItem("\xE2\x97\x86  Model (glTF)")) do_add(2);
-          if (ImGui::MenuItem("\xE2\x86\xBB  Animasyonlu Model")) do_add(9);
-          ImGui::Separator();
-          if (ImGui::BeginMenu("\xE2\x97\xBC  3B Nesneler (Primitives)")) {
-            if (ImGui::MenuItem("\xE2\x97\xBC  K\xC3\xBCp")) do_add(10);
-            if (ImGui::MenuItem("\xE2\x97\x8F  K\xC3\xBCre")) do_add(11);
-            if (ImGui::MenuItem("\xE2\x97\xBC  Kaps\xC3\xBCl")) do_add(content::kPrimCapsule);
-            if (ImGui::MenuItem("\xE2\x97\xBC  Silindir")) do_add(content::kPrimCylinder);
-            if (ImGui::MenuItem("\xE2\x97\xBC  Koni")) do_add(content::kPrimCone);
-            if (ImGui::MenuItem("\xE2\x96\xAC  D\xC3\xBCzlem / Zemin")) do_add(8);
-            if (ImGui::MenuItem("\xE2\x96\xAC  D\xC3\xB6rtgen (Quad)")) do_add(content::kPrimQuad);
-            if (ImGui::MenuItem("\xE2\x97\xBC  Simit (Torus)")) do_add(content::kPrimTorus);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x98\x80  I\xC5\x9F\xC4\xB1k & Ayd\xC4\xB1nlatma")) {
-            if (ImGui::MenuItem("\xE2\x98\x80  Y\xC3\xB6nl\xC3\xBC G\xC3\xBCne\xC5\x9F (Directional)")) do_add(14);
-            if (ImGui::MenuItem(ICON_MD_WB_SUNNY "  I\xC5\x9F\xC4\xB1k H\xC3\xBCzmeli G\xC3\xBCne\xC5\x9F (Sun + God Rays)")) do_add(19);
-            if (ImGui::MenuItem("\xE2\x97\x8F  Nokta I\xC5\x9F\xC4\xB1k (Point)")) do_add(3);
-            if (ImGui::MenuItem("\xE2\x86\x98  Spot I\xC5\x9F\xC4\xB1k (Spot Koni)")) do_add(15);
-            if (ImGui::MenuItem(ICON_MD_FLASHLIGHT_ON "  Hacimsel Spot I\xC5\x9F\xC4\xB1k (Volumetric)")) do_add(63);
-            if (ImGui::MenuItem(ICON_MD_AUTO_AWESOME "  I\xC5\x9F\xC4\xB1k H\xC3\xBCzmesi (God Rays Shafts)")) do_add(64);
-            ImGui::Separator();
-            if (ImGui::MenuItem("\xE2\x96\xAD  Alan / Dikd\xC3\xB6rtgen (Rect LTC)")) do_add(16);
-            if (ImGui::MenuItem("\xE2\x95\x90  T\xC3\xBCp / Kaps\xC3\xBCl I\xC5\x9F\xC4\xB1k")) do_add(17);
-            if (ImGui::MenuItem("\xE2\x97\x89  Disk I\xC5\x9F\xC4\xB1k")) do_add(18);
-            ImGui::EndMenu();
-          }
-          if (ImGui::MenuItem("\xE2\x98\x81  G\xC3\xB6ky\xC3\xBCz\xC3\xBC & Atmosfer (Skybox)")) do_add(36);
-          if (ImGui::MenuItem("\xE2\x96\xB2  Prosed\xC3\xBCrel Arazi (Terrain)")) do_add(31);
-          if (ImGui::MenuItem("\xE2\x89\x88  Dinamik Su (Ocean / Water)")) do_add(32);
-          ImGui::Separator();
-          if (ImGui::BeginMenu("\xE2\x97\x89  \xC3\x87" "evre Hacimleri (Volumes)")) {
-            if (ImGui::MenuItem("\xE2\x97\x89  Yans\xC4\xB1ma Sondas\xC4\xB1 (Probe)")) do_add(37);
-            if (ImGui::MenuItem("\xE2\x97\x87  I\xC5\x9F\xC4\xB1k Hacmi Sondas\xC4\xB1 (GI Grid)")) do_add(45);
-            if (ImGui::MenuItem("\xE2\x96\xA8  Hacimsel Sis Hacmi (Fog Volume)")) do_add(46);
-            if (ImGui::MenuItem("\xE2\x97\x8E  Yank\xC4\xB1 Alan\xC4\xB1 (Reverb)")) do_add(44);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x96\xB2  Do\xC4\x9F" "a & Zemin Akt\xC3\xB6rleri")) {
-            if (ImGui::MenuItem("\xE2\x96\xB2  Prosed\xC3\xBCrel Arazi (Terrain)")) do_add(31);
-            if (ImGui::MenuItem("\xE2\x89\x88  Dinamik Su (Gerstner)")) do_add(32);
-            if (ImGui::MenuItem("\xE2\x96\xA6  Voksel D\xC3\xBCnyas\xC4\xB1")) do_add(33);
-            if (ImGui::MenuItem("\xE2\x86\xAF  R\xC3\xBCzgar Alan\xC4\xB1")) do_add(34);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x88\xB4  G\xC3\xB6rsel Efektler (VFX)")) {
-            if (ImGui::MenuItem("\xE2\x9A\xA1  Yang\xC4\xB1n & Ate\xC5\x9F (Fire & Embers)")) do_add(35);
-            if (ImGui::MenuItem("\xE2\x96\x91  Duman & Toz (Smoke & Dust)")) do_add(60);
-            if (ImGui::MenuItem("\xE2\x9A\xA1  K\xC4\xB1v\xC4\xB1lc\xC4\xB1m & \xC3\x87" "arp\xC4\xB1\xC5\x9Fma (Sparks)")) do_add(61);
-            if (ImGui::MenuItem("\xE2\x98\x94  Ya\xC4\x9Fmur & Kar (Precipitation)")) do_add(62);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x97\xBC  Fizik Nesneleri")) {
-            if (ImGui::MenuItem("\xE2\x96\xA1  Sabit Kutu G\xC3\xB6vde")) do_add(4);
-            if (ImGui::MenuItem("\xE2\x97\x8B  Sabit K\xC3\xBCre G\xC3\xB6vde")) do_add(5);
-            if (ImGui::MenuItem("\xE2\x96\xA7  Dinamik Kutu G\xC3\xB6vde")) do_add(6);
-            if (ImGui::MenuItem("\xE2\x97\x8D  Dinamik K\xC3\xBCre G\xC3\xB6vde")) do_add(7);
-            if (ImGui::MenuItem("\xE2\x8A\x99  Karakter Kontrolc\xC3\xBC")) do_add(30);
-            if (ImGui::MenuItem("\xE2\x88\x9E  Fizik Eklemi (Joint)")) do_add(43);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x9A\x94  Oynan\xC4\xB1\xC5\x9F & RPG")) {
-            if (ImGui::MenuItem("\xE2\x99\xA5  Can & Z\xC4\xB1rh Varl\xC4\xB1\xC4\x9F\xC4\xB1")) do_add(40);
-            if (ImGui::MenuItem("\xE2\x9A\x94  B\xC3\xBCy\xC3\xBC / Yetenek Varl\xC4\xB1\xC4\x9F\xC4\xB1 (GAS)")) do_add(41);
-            if (ImGui::MenuItem("\xE2\x96\xA3  Sand\xC4\xB1k / Envanter (Inventory)")) do_add(42);
-            if (ImGui::MenuItem("\xE2\x86\x92  Yapay Zeka Ajan\xC4\xB1 (NavAgent)")) do_add(39);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x99\xAA  Ses & Akustik")) {
-            if (ImGui::MenuItem("\xE2\x99\xAA  3B Ses Kayna\xC4\x9F\xC4\xB1")) do_add(13);
-            if (ImGui::MenuItem("\xE2\x97\x8E  Yank\xC4\xB1 Alan\xC4\xB1 (Reverb)")) do_add(44);
-            ImGui::EndMenu();
-          }
-          if (ImGui::MenuItem("\xE2\x96\xA3  Kamera Varl\xC4\xB1\xC4\x9F\xC4\xB1")) do_add(12);
-          if (ImGui::MenuItem("\xE2\x96\xA4  Tulpar Betik Nesnesi")) do_add(38);
-          ImGui::EndMenu();
-        }
-
-        // --- 2. HIZLI DEVRİMSEL ŞABLONLAR ---
-        if (ImGui::BeginMenu("\xE2\x9A\xA1  H\xC4\xB1zl\xC4\xB1 \xC5\x9E" "ablonlar (Haz\xC4\xB1r Kurulum)")) {
-          if (ImGui::MenuItem(ICON_MD_SCIENCE "  Fizik Test Odas\xC4\xB1 (Zemin + D\xC3\xBC\xC5\x9F" "enler)")) do_add(50);
-          if (ImGui::MenuItem(ICON_MD_LANDSCAPE "  Do\xC4\x9F" "a Paketi (G\xC3\xBCne\xC5\x9F + Skybox + Arazi + Su)")) do_add(51);
-          if (ImGui::MenuItem("\xE2\x9A\x94  RPG Sahnesi (Karakter + Yetenek + Sand\xC4\xB1k)")) do_add(52);
+          const int r = create_menu_draw(kCreateMenu, kCreateMenuCount);
+          if (r > 0) do_add(r);
           ImGui::EndMenu();
         }
 
@@ -3684,8 +3610,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         if (ImGui::Button("+ K\xC3\xBCp", ImVec2(btn_w, 0))) do_add(10);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Temel Küp Primitifi Ekle");
         ImGui::SameLine();
-        if (ImGui::Button("+ Su", ImVec2(btn_w, 0))) do_add(32);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Dinamik Gerstner Su / Dalga Alanı Ekle");
+        if (ImGui::Button("+ Huzme", ImVec2(btn_w, 0))) do_add(64);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hacimsel Işık Hüzmesi (Fake Godray Beam) Ekle");
         ImGui::SameLine();
         if (ImGui::Button("+ G\xC3\xB6k", ImVec2(btn_w, 0))) do_add(36);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Atmosfer ve Skybox Ekle");
@@ -4542,6 +4468,71 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       // isiklari begin_frame oncesi on-geciste zaten ekliyor, ikisi birlikte
       // her isigi IKI KEZ kaydediyordu (kume butcesi iki katina cikar, parlaklik
       // ikiye katlanirdi). Kip kapisi on-gecise tasindi (yukari bak).
+    }
+    // --- 3B Hacimsel Isik Huzmeleri (Indoor & Outdoor Fake Volumetric God Rays) ---
+    // Kapali mekanlarda, odalarda, pencerelerde ve spot isiklar altinda raymarching
+    // gerektirmeyen, sifir GPU yuklu gercek 3B hacimsel isik konileri cizilir.
+    if (st.scene.godrays_enabled && st.prims[content::kPrimCone].valid()) {
+      for (uint32_t i = 0; i < st.scene.entity_count; i++) {
+        const SceneEntity &e = st.scene.entities[i];
+        if (!(e.components & content::kSceneLight) || !e.light_godray || (e.flags & content::kSceneHidden)) continue;
+
+        const Mat4 m = content::scene_entity_world_matrix(st.scene, i);
+        const Vec3 p = {m.m[3][0], m.m[3][1], m.m[3][2]};
+
+        Vec3 dir{0.0f, -1.0f, 0.0f};
+        float reach = e.light_radius > 0.5f ? e.light_radius : 10.0f;
+        float outer_rad = 2.0f;
+
+        if (e.light_type == content::SceneLightType::Spot) {
+          Vec3 fwd{-m.m[2][0], -m.m[2][1], -m.m[2][2]};
+          dir = length_sq(fwd) > 1e-6f ? normalize(fwd) : Vec3{0.0f, -1.0f, 0.0f};
+          float half_angle = e.light_spot_outer * (3.14159265f / 180.0f);
+          outer_rad = std::tan(half_angle) * reach;
+          if (outer_rad < 0.2f) outer_rad = 0.2f;
+        } else if (e.light_type == content::SceneLightType::Directional) {
+          Vec3 fwd{-m.m[2][0], -m.m[2][1], -m.m[2][2]};
+          dir = length_sq(fwd) > 1e-6f ? normalize(fwd) : Vec3{0.0f, -1.0f, 0.0f};
+          reach = 16.0f;
+          outer_rad = 4.5f;
+        } else { // Point light: lambadan asagi yumusak koni
+          reach = e.light_radius > 0.5f ? e.light_radius * 0.75f : 5.0f;
+          outer_rad = reach * 0.6f;
+        }
+
+        Vec3 up_ref = std::abs(dir.y) < 0.95f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+        Vec3 rgt = normalize(cross(dir, up_ref));
+        Vec3 up_v = cross(rgt, dir);
+
+        Mat4 cone_m;
+        // Col 0 (X): rgt * (outer_rad * 2.0f)
+        cone_m.m[0][0] = rgt.x * (outer_rad * 2.0f);
+        cone_m.m[0][1] = rgt.y * (outer_rad * 2.0f);
+        cone_m.m[0][2] = rgt.z * (outer_rad * 2.0f);
+        cone_m.m[0][3] = 0.0f;
+
+        // Col 1 (Y): -dir * reach
+        cone_m.m[1][0] = -dir.x * reach;
+        cone_m.m[1][1] = -dir.y * reach;
+        cone_m.m[1][2] = -dir.z * reach;
+        cone_m.m[1][3] = 0.0f;
+
+        // Col 2 (Z): up_v * (outer_rad * 2.0f)
+        cone_m.m[2][0] = up_v.x * (outer_rad * 2.0f);
+        cone_m.m[2][1] = up_v.y * (outer_rad * 2.0f);
+        cone_m.m[2][2] = up_v.z * (outer_rad * 2.0f);
+        cone_m.m[2][3] = 0.0f;
+
+        // Col 3 (T): p + dir * (reach * 0.5f)
+        Vec3 center = p + dir * (reach * 0.5f);
+        cone_m.m[3][0] = center.x;
+        cone_m.m[3][1] = center.y;
+        cone_m.m[3][2] = center.z;
+        cone_m.m[3][3] = 1.0f;
+
+        Vec3 beam_col = e.light_color * (e.light_godray_intensity * 0.85f);
+        ren.draw(st.prims[content::kPrimCone], st.beam_mat, cone_m, beam_col);
+      }
     }
     // --- RDR2 tarzi sinematik isik huzmesi (God Rays) cekirdek cizimi --------
     // Sahnedeki engellerin (duvar, kutu) gunesi fiziksel olarak perdelemesi ve

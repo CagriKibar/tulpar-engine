@@ -750,36 +750,80 @@ const CreateMenuItem kCreate3D[] = {
     {"Kaps\xC3\xBCl", "\xE2\x97\xBC", 20, nullptr, 0},  // ◼
     {"Silindir", "\xE2\x97\xBC", 21, nullptr, 0},   // ◼
     {"Koni", "\xE2\x97\xBC", 22, nullptr, 0},       // ◼
-    {"D\xC3\xBCzlem", "\xE2\x96\xAC", 8, nullptr, 0},   // ▬
-    {"D\xC3\xB6rtgen", "\xE2\x96\xAC", 23, nullptr, 0}, // ▬
-    {"Simit", "\xE2\x97\xBC", 24, nullptr, 0},      // ◼
+    {"D\xC3\xBCzlem / Zemin", "\xE2\x96\xAC", 8, nullptr, 0},   // ▬
+    {"D\xC3\xB6rtgen (Quad)", "\xE2\x96\xAC", 23, nullptr, 0}, // ▬
+    {"Simit (Torus)", "\xE2\x97\xBC", 24, nullptr, 0},      // ◼
 };
 const CreateMenuItem kCreateLight[] = {
-    {"Y\xC3\xB6nl\xC3\xBC (G\xC3\xBCne\xC5\x9F)", "\xE2\x86\x97", 14, nullptr, 0}, // ↗
-    {"Nokta", "\xE2\x97\x8F", 3, nullptr, 0},                           // ●
+    {"Y\xC3\xB6nl\xC3\xBC G\xC3\xBCne\xC5\x9F (Directional)", "\xE2\x98\x80", 14, nullptr, 0}, // ☀
+    {"I\xC5\x9F\xC4\xB1k H\xC3\xBCzmeli G\xC3\xBCne\xC5\x9F (Sun + God Rays)", ICON_MD_WB_SUNNY, 19, nullptr, 0},
+    {"Nokta I\xC5\x9F\xC4\xB1k (Point)", "\xE2\x97\x8F", 3, nullptr, 0},                           // ●
+    {"Spot I\xC5\x9F\xC4\xB1k (Spot Koni)", "\xE2\x86\x98", 15, nullptr, 0},                         // ↘
+    {"Hacimsel I\xC5\x9F\xC4\xB1k H\xC3\xBCzmesi (Fake Godray Beam)", ICON_MD_AUTO_AWESOME, 64, nullptr, 0},
+    {"Hacimsel Spot I\xC5\x9F\xC4\xB1k (Volumetric)", ICON_MD_FLASHLIGHT_ON, 63, nullptr, 0},
+    {"Alan / Dikd\xC3\xB6rtgen (Rect LTC)", "\xE2\x96\xAD", 16, nullptr, 0},
+    {"T\xC3\xBCp / Kaps\xC3\xBCl I\xC5\x9F\xC4\xB1k", "\xE2\x95\x90", 17, nullptr, 0},
+    {"Disk I\xC5\x9F\xC4\xB1k", "\xE2\x97\x89", 18, nullptr, 0},
+};
+const CreateMenuItem kCreateEnvironment[] = {
+    {"G\xC3\xB6ky\xC3\xBCz\xC3\xBC & Atmosfer (Skybox)", "\xE2\x98\x81", 36, nullptr, 0}, // ☁
+    {"Prosed\xC3\xBCrel Arazi (Terrain)", "\xE2\x96\xB2", 31, nullptr, 0},              // ▲
+    {"Dinamik Su (Gerstner)", "\xE2\x89\x88", 32, nullptr, 0},                         // ≈
+    {"Voksel D\xC3\xBCnyas\xC4\xB1", "\xE2\x96\xA6", 33, nullptr, 0},                  // ▦
+    {"R\xC3\xBCzgar Alan\xC4\xB1", "\xE2\x86\xAF", 34, nullptr, 0},                    // ↯
+};
+const CreateMenuItem kCreateVolumes[] = {
+    {"Hacimsel Sis Hacmi (Fog Volume)", "\xE2\x96\xA8", 46, nullptr, 0},
+    {"Yans\xC4\xB1ma Sondas\xC4\xB1 (Probe)", "\xE2\x97\x89", 37, nullptr, 0},
+    {"I\xC5\x9F\xC4\xB1k Hacmi Sondas\xC4\xB1 (GI Grid)", "\xE2\x97\x87", 45, nullptr, 0},
+    {"Yank\xC4\xB1 Alan\xC4\xB1 (Reverb)", "\xE2\x97\x8E", 44, nullptr, 0},
+};
+const CreateMenuItem kCreateVFX[] = {
+    {"Yang\xC4\xB1n & Ate\xC5\x9F (Fire & Embers)", "\xE2\x9A\xA1", 35, nullptr, 0},
+    {"Duman & Toz (Smoke & Dust)", "\xE2\x96\x91", 60, nullptr, 0},
+    {"K\xC4\xB1v\xC4\xB1lc\xC4\xB1m & \xC3\x87" "arp\xC4\xB1\xC5\x9Fma (Sparks)", "\xE2\x9A\xA1", 61, nullptr, 0},
+    {"Ya\xC4\x9Fmur & Kar (Precipitation)", "\xE2\x98\x94", 62, nullptr, 0},
 };
 const CreateMenuItem kCreatePhysics[] = {
     {"Sabit Kutu G\xC3\xB6vde", "\xE2\x96\xA1", 4, nullptr, 0},    // □
     {"Sabit K\xC3\xBCre G\xC3\xB6vde", "\xE2\x97\x8B", 5, nullptr, 0},  // ○
     {"Dinamik Kutu G\xC3\xB6vde", "\xE2\x96\xA7", 6, nullptr, 0},  // ▧
     {"Dinamik K\xC3\xBCre G\xC3\xB6vde", "\xE2\x97\x8D", 7, nullptr, 0}, // ◍
+    {"Karakter Kontrolc\xC3\xBC", "\xE2\x8A\x99", 30, nullptr, 0},
+    {"Fizik Eklemi (Joint)", "\xE2\x88\x9E", 43, nullptr, 0},
+};
+const CreateMenuItem kCreateGameplay[] = {
+    {"Can & Z\xC4\xB1rh Varl\xC4\xB1\xC4\x9F\xC4\xB1", "\xE2\x99\xA5", 40, nullptr, 0},
+    {"B\xC3\xBCy\xC3\xBC / Yetenek Varl\xC4\xB1\xC4\x9F\xC4\xB1 (GAS)", "\xE2\x9A\x94", 41, nullptr, 0},
+    {"Sand\xC4\xB1k / Envanter (Inventory)", "\xE2\x96\xA3", 42, nullptr, 0},
+    {"Yapay Zeka Ajan\xC4\xB1 (NavAgent)", "\xE2\x86\x92", 39, nullptr, 0},
 };
 const CreateMenuItem kCreateAudio[] = {
-    {"Ses Kayna\xC4\x9F\xC4\xB1", ICON_MD_VOLUME_UP, 13, nullptr, 0},
+    {"3B Ses Kayna\xC4\x9F\xC4\xB1", ICON_MD_VOLUME_UP, 13, nullptr, 0},
+    {"Yank\xC4\xB1 Alan\xC4\xB1 (Reverb)", "\xE2\x97\x8E", 44, nullptr, 0},
+};
+const CreateMenuItem kCreateTemplates[] = {
+    {"Fizik Test Odas\xC4\xB1 (Zemin + D\xC3\xBC\xC5\x9F" "enler)", ICON_MD_SCIENCE, 50, nullptr, 0},
+    {"Do\xC4\x9F" "a Paketi (G\xC3\xBCne\xC5\x9F + Skybox + Su)", ICON_MD_LANDSCAPE, 51, nullptr, 0},
+    {"RPG Sahnesi (Karakter + Yetenek + Sand\xC4\xB1k)", "\xE2\x9A\x94", 52, nullptr, 0},
 };
 const CreateMenuItem kCreateMenu[] = {
     {"Bo\xC5\x9F Varl\xC4\xB1k", "\xE2\x97\x8B", 1, nullptr, 0}, // ○
     {"Model (glTF)", "\xE2\x97\x86", 2, nullptr, 0},     // ◆
     {"Animasyonlu Model", "\xE2\x86\xBB", 9, nullptr, 0},   // ↻
-    {"3B Nesne", nullptr, 0, kCreate3D, 8},
-    // Isik TEK secenek DEGIL, alt menu: tur burada ayrilir (Unity'nin
-    // Light > Directional/Point ile ayni fikir).
-    {"I\xC5\x9F\xC4\xB1k", "\xE2\x98\x80", 0, kCreateLight, 2}, // ☀
-    {"Fizik", nullptr, 0, kCreatePhysics, 4},
-    {"Ses", nullptr, 0, kCreateAudio, 1},
+    {"3B Nesneler (Primitives)", nullptr, 0, kCreate3D, (uint32_t)(sizeof(kCreate3D) / sizeof(kCreate3D[0]))},
+    {"I\xC5\x9F\xC4\xB1k & Ayd\xC4\xB1nlatma", "\xE2\x98\x80", 0, kCreateLight, (uint32_t)(sizeof(kCreateLight) / sizeof(kCreateLight[0]))},
+    {"\xC3\x87" "evre & Do\xC4\x9F" "a", "\xE2\x96\xB2", 0, kCreateEnvironment, (uint32_t)(sizeof(kCreateEnvironment) / sizeof(kCreateEnvironment[0]))},
+    {"\xC3\x87" "evre Hacimleri (Volumes)", "\xE2\x97\x89", 0, kCreateVolumes, (uint32_t)(sizeof(kCreateVolumes) / sizeof(kCreateVolumes[0]))},
+    {"G\xC3\xB6rsel Efektler (VFX)", "\xE2\x88\xB4", 0, kCreateVFX, (uint32_t)(sizeof(kCreateVFX) / sizeof(kCreateVFX[0]))},
+    {"Fizik Nesneleri", "\xE2\x96\xA1", 0, kCreatePhysics, (uint32_t)(sizeof(kCreatePhysics) / sizeof(kCreatePhysics[0]))},
+    {"Oynan\xC4\xB1\xC5\x9F & RPG", "\xE2\x9A\x94", 0, kCreateGameplay, (uint32_t)(sizeof(kCreateGameplay) / sizeof(kCreateGameplay[0]))},
+    {"Ses & Akustik", ICON_MD_VOLUME_UP, 0, kCreateAudio, (uint32_t)(sizeof(kCreateAudio) / sizeof(kCreateAudio[0]))},
     {"Kamera Varl\xC4\xB1\xC4\x9F\xC4\xB1", ICON_MD_VIDEOCAM, 12, nullptr, 0},
+    {"Tulpar Betik Nesnesi", "\xE2\x96\xA4", 38, nullptr, 0},
+    {"H\xC4\xB1zl\xC4\xB1 \xC5\x9E" "ablonlar", "\xE2\x9A\xA1", 0, kCreateTemplates, (uint32_t)(sizeof(kCreateTemplates) / sizeof(kCreateTemplates[0]))},
 };
-const uint32_t kCreateMenuCount = 8;
+const uint32_t kCreateMenuCount = (uint32_t)(sizeof(kCreateMenu) / sizeof(kCreateMenu[0]));
 
 int create_menu_draw(const CreateMenuItem *items, uint32_t count) {
   int result = 0;
