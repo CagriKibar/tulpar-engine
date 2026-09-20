@@ -174,6 +174,7 @@ struct HierarchyState {
   HierarchyCollapse collapse;
   HierarchyRename rename;
   int32_t drag_source = -1; // suruklenen varlik (yalniz gosterim)
+  int32_t hovered_index = -1; // fare altindaki satir indeksi (-1 = satir yok)
 };
 enum class HierarchyAction : uint32_t {
   None = 0,
@@ -189,6 +190,8 @@ enum class HierarchyAction : uint32_t {
   Cut,        // baglam menusu: Kes
   Copy,       // baglam menusu: Kopyala
   Paste,      // baglam menusu: Yapistir
+  Focus,      // baglam menusu: Varliga odaklan (F)
+  CreateChild,// baglam menusu: Bos cocuk varlik ekle
 };
 struct HierarchyResult {
   HierarchyAction action = HierarchyAction::None;

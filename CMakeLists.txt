@@ -45,7 +45,7 @@ target_link_libraries(engine_platform PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 # --- Katman denetimi --------------------------------------------------------
 add_custom_target(engine_layer_check
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/layer_check.py ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/tools/layer_check.py ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "engine: katman bagimlilik denetimi (ihlal = build hatasi)"
     VERBATIM
 )
@@ -174,6 +174,7 @@ target_compile_options(engine_recast PRIVATE -fno-exceptions -fno-rtti -w -ffp-c
 # --- L4 SIM (ECS, zamanlayici, sabit adim, replay, fizik, navmesh) -----------
 add_library(engine_sim STATIC
     sim/ecs.cpp
+    sim/ability_system.cpp
     sim/schedule.cpp
     sim/timers.cpp
     sim/physics.cpp
@@ -218,7 +219,7 @@ target_compile_options(engine_renderer PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${ENGIN
 add_dependencies(engine_renderer engine_layer_check)
 
 # --- L6 CONTENT: glTF (cgltf) + goruntu (stb_image), yalniz yukleme aninda malloc ---
-add_library(engine_content STATIC content/gltf.cpp content/meshopt.cpp content/ktx2.cpp content/font.cpp content/scene.cpp content/scene_blob.cpp content/scene_runtime.cpp content/primitives.cpp content/vendored_impl.c
+add_library(engine_content STATIC content/gltf.cpp content/meshopt.cpp content/ktx2.cpp content/font.cpp content/scene.cpp content/scene_blob.cpp content/scene_runtime.cpp content/primitives.cpp content/prefab.cpp content/vendored_impl.c
     # --- PR #322: yeni icerik modulleri (content/pack.cpp ALINMADI: main'in
     # .tpak'i mmap'li, belirlenimli ve kapili — PR'inki daha basit bir format)
     content/voxel.cpp content/morph.cpp content/terrain.cpp content/lod_select.cpp content/water_wave.cpp content/wind.cpp content/occlusion.cpp content/clod_format.cpp content/device_tier.cpp content/dynamic_quality.cpp)
@@ -286,6 +287,9 @@ set(ENGINE_TEST_SOURCES
     tests/test_pack.cpp
     tests/test_input.cpp
     tests/test_layout.cpp
+    tests/test_reflect.cpp
+    tests/test_prefab.cpp
+    tests/test_graph_builder.cpp
     # --- PR #322 testleri (test_dsp/test_spatial/test_scene_format ALINMADI:
     # olctukleri surumler main'dekilerle degistirildi)
     tests/test_ik.cpp

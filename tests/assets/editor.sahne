@@ -3,7 +3,7 @@ isik-yon 0.5 1 0.35
 isik-ortam 0.16 0.17 0.2
 isik-gunes 0.85
 golge 0 1 -1 17 70
-kamera 0 1 -3 0.7 0.45 26
+kamera -8.388319 1.2265239 3.9223223 -0.18499982 0.445 6.608848
 kaynak "lod_sphere.gltf"
 kaynak "skin_tube.gltf"
 kaynak "checker_cube.gltf"

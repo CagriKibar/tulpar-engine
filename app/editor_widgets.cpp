@@ -221,7 +221,7 @@ PropItem prop_vec3(const char *label, float v[3], float speed, float min, float 
   // panelini "oyuncak" gosteriyordu; sektor editorlerinde (UE5) eksen rengi
   // ince bir kenar isaretidir, yuzey degil.
   float badge_w = std::floor(ImGui::CalcTextSize("X").x + s.FramePadding.x);
-  const float overlap = s.FrameRounding;
+  const float overlap = 2.0f; // Rozet, girdi kutusunun sol kenarini ortsun ama metin/eksi isaretini ASLA kapatmasin
   const float gap = s.ItemInnerSpacing.x;
   float field_w = std::floor((w - 3.0f * (badge_w - overlap) - 2.0f * gap) / 3.0f);
   // Alan, iki yandaki dolgudan SONRA en az "-000.00" kadar metin tasimali.
@@ -596,16 +596,22 @@ const CreateMenuItem kCompEnvironment[] = {
     {"Su (Gerstner)", "\xE2\x89\x88", content::kSceneWater, nullptr, 0},
     // ▦ (U+25A6): izgarali kare = voksel kafesi.
     {"Voksel D\xC3\xBCnyas\xC4\xB1", "\xE2\x96\xA6", content::kSceneVoxel, nullptr, 0},
-    // ☁ (U+2601): ICON_MD_CLOUD yerine; ayni fontta ☀ (U+2600) zaten
-    // kullaniliyor, komsu kod noktasi da var (olculdu).
-    {"G\xC3\xB6ky\xC3\xBCz\xC3\xBC (Skybox)", "\xE2\x98\x81", content::kSceneSkybox, nullptr, 0},
     // ◉ (U+25C9): parlayan kure = yansima sondasi. ICON_MD_LENS yerine.
     {"Yans\xC4\xB1ma Sondas\xC4\xB1 (Probe)", "\xE2\x97\x89", content::kSceneRefProbe, nullptr, 0},
+    {"G\xC3\xB6ky\xC3\xBCz\xC3\xBC & Atmosfer (Skybox)", "\xE2\x98\x81", content::kSceneSkybox, nullptr, 0},
 };
 const CreateMenuItem kCompAI[] = {
     // → (U+2192): yol izleyen ajan. ICON_MD_DIRECTIONS_RUN yerine; kosan
     // insan glifi (emoji) fontta yok.
     {"Yapay Zeka Ajan\xC4\xB1 (NavAgent)", "\xE2\x86\x92", content::kSceneNavAgent, nullptr, 0},
+};
+const CreateMenuItem kCompGameplay[] = {
+    // ♥ (U+2665): Kalp
+    {"Can / Z\xC4\xB1rh (Health)", "\xE2\x99\xA5", content::kSceneHealth, nullptr, 0},
+    // ⚔ (U+2694): Kiliclar
+    {"B\xC3\xBCy\xC3\xBC / Yetenek (GAS)", "\xE2\x9A\x94", content::kSceneAbility, nullptr, 0},
+    // ▣ (U+25A3): Kutu (Envanter cantasi gibi)
+    {"Envanter", "\xE2\x96\xA3", content::kSceneInventory, nullptr, 0},
 };
 const CreateMenuItem kComponentMenu[] = {
     {"Render", nullptr, 0, kCompModel, 2},
@@ -617,8 +623,9 @@ const CreateMenuItem kComponentMenu[] = {
     {"Ses", nullptr, 0, kCompAudio, 2},
     {"Betik", nullptr, 0, kCompScript, 1},
     {"Yapay Zeka (AI)", nullptr, 0, kCompAI, 1},
+    {"Oynan\xC4\xB1\xC5\x9F (Gameplay)", nullptr, 0, kCompGameplay, 3},
 };
-const uint32_t kComponentMenuCount = 9;
+const uint32_t kComponentMenuCount = 10;
 
 namespace {
 
@@ -966,6 +973,7 @@ HierarchyResult hierarchy_row_impl(int id, const HierarchyRow &r, HierarchyState
   const bool hovered = ImGui::IsItemHovered() ||
                        (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
                         ImGui::IsMouseHoveringRect(ImVec2(rr.x0, rr.y0), ImVec2(rr.x1, rr.y1)));
+  if (hovered && st) st->hovered_index = id;
   g_row_layout.arrow = g_row_layout.eye = g_row_layout.lock = WidgetRect{};
   const bool dbl = clicked && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
   if (clicked && !dbl) {
@@ -1011,6 +1019,11 @@ HierarchyResult hierarchy_row_impl(int id, const HierarchyRow &r, HierarchyState
       if (ImGui::MenuItem("Kes", "Ctrl+X")) res.action = HierarchyAction::Cut;
       if (ImGui::MenuItem("Kopyala", "Ctrl+C")) res.action = HierarchyAction::Copy;
       if (ImGui::MenuItem("Yap\xC4\xB1\xC5\x9Ft\xC4\xB1r", "Ctrl+V")) res.action = HierarchyAction::Paste;
+      ImGui::Separator();
+      if (ImGui::MenuItem("Varl\xC4\xB1\xC4\x9F" "a odaklan", "F")) { res.action = HierarchyAction::Focus; res.index = id; }
+      if (ImGui::MenuItem("Bo\xC5\x9F \xC3\xA7ocuk ekle")) { res.action = HierarchyAction::CreateChild; res.index = id; }
+      if (ImGui::MenuItem(r.hidden ? "G\xC3\xB6r\xC3\xBCn\xC3\xBCr yap" : "Gizle")) { res.action = HierarchyAction::Visibility; res.index = id; }
+      if (ImGui::MenuItem(r.locked ? "Kilidi a\xC3\xA7" : "Kilitle")) { res.action = HierarchyAction::Lock; res.index = id; }
       ImGui::EndPopup();
     }
     if (dbl) st->rename.begin(id, r.name); // cift tik: yerinde ad
@@ -1041,8 +1054,8 @@ HierarchyResult hierarchy_row_impl(int id, const HierarchyRow &r, HierarchyState
   const char *icon;
   Tone it;
   if (r.has_light) { icon = "\xE2\x98\x80"; it = Tone::Warn; }       // ☀
-  else if (r.has_model) { icon = "\xE2\x97\x86"; it = Tone::Text; }  // ◆
-  else if (r.has_body) { icon = "\xE2\x97\xBC"; it = Tone::AxisZ; }  // ◼
+  else if (r.has_model) { icon = "\xE2\x97\x86"; it = Tone::Accent; } // ◆ Accent (Canli Turkuaz)
+  else if (r.has_body) { icon = "\xE2\x97\xBC"; it = Tone::AxisZ; }  // ◼ (Mavi)
   else { icon = "\xE2\x97\x8B"; it = Tone::TextDim; }                // ○
   const float icon_col = std::floor(fs * 1.05f);
   const ImVec2 isz = ImGui::CalcTextSize(icon);
@@ -1120,6 +1133,9 @@ HierarchyResult hierarchy_root_drop_zone(HierarchyState *st) {
   const float avail = ImGui::GetContentRegionAvail().y;
   if (avail < 4.0f) return res; // yer yok: hicbir sey cizme (gorunmez oge de yok)
   ImGui::InvisibleButton("##kok_birakma", ImVec2(-FLT_MIN, avail));
+  if (ImGui::IsItemHovered() && (ImGui::IsMouseClicked(ImGuiMouseButton_Right) || ImGui::IsMouseReleased(ImGuiMouseButton_Right))) {
+    ImGui::OpenPopup("SahnePanelMenu");
+  }
   if (ImGui::BeginDragDropTarget()) {
     // Cerceve: birakilabilir alan GORUNSUN (sessiz hedef kullanilamaz).
     const WidgetRect z = item_rect();
