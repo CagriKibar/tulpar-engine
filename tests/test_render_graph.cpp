@@ -226,7 +226,17 @@ ENGINE_TEST(render_graph_table_is_compiled_and_ordered) {
   const uint32_t n4 = graph_build(d4, g, kMaxGraphPasses);
   std::printf("    [bilgi] en genis tablo: %u gecis (kapasite %u)\n", n4, kMaxGraphPasses);
   CHECK(n4 == kMaxGraphPasses);
-  CHECK(graph_validate(g, n4) == nullptr);
+  // Godray ACIK tablo: godray gecisi (bloom ile birlestir arasinda) eklenir
+  GraphDesc d5;
+  d5.post = true;
+  d5.godray = true;
+  d5.shadow = true;
+  d5.bloom_mips = 4;
+  const uint32_t n5 = graph_build(d5, g, kMaxGraphPasses);
+  CHECK(n5 == 11);
+  CHECK(std::strcmp(g[9].name, "godray") == 0);
+  CHECK(g[9].kind == PassKind::Godray);
+  CHECK(graph_validate(g, n5) == nullptr);
 
   // KONTROL: denetim gercekten denetliyor mu? Ureticisi olmayan girdi ve
   // okuyucusu olmayan cikti REDDEDILMELI; edilmezse yukaridaki nullptr bos.
@@ -472,7 +482,16 @@ ENGINE_TEST(render_graph_post_mali_best_practices) {
   dc.best_practices = true;
   if (!dev.init(sys, g_api_bp, dc)) { skip("Vulkan cihazi yok"); return; }
   if (!dev.caps().validation_layer) {
-    skip("VK_LAYER_KHRONOS_validation yok — post yolunun Mali denetimi kosmadi");
+    // Katman neden yok? IKI COK FARKLI SEBEP, eskiden tek mesaja sikistirilmisti:
+    //   (a) katman kurulu degil                     -> ortam eksigi
+    //   (b) loader ATLANDI (macOS dogrudan MoltenVK) -> katman zinciri YOK,
+    //       VK_LAYER_PATH ne derse desin hicbir sey degismez
+    // (b) bir ORTAM EKSIGI DEGIL, motorun kendi yolu. CI kapisi ikisini
+    // ayirt edebilsin diye metinler AYRI (olculdu CI macOS 2026-09-20).
+    if (dev.caps().loader_bypassed)
+      skip("loader ATLANDI (dogrudan MoltenVK) — katman zinciri YOK; post yolunun Mali denetimi kosmadi");
+    else
+      skip("VK_LAYER_KHRONOS_validation yok — post yolunun Mali denetimi kosmadi");
     dev.shutdown();
     return;
   }
@@ -937,7 +956,16 @@ ENGINE_TEST(render_graph_gpu_cull_mali_best_practices) {
   dc.best_practices = true;
   if (!dev.init(sys, g_api_bp, dc)) { skip("Vulkan cihazi yok"); return; }
   if (!dev.caps().validation_layer) {
-    skip("VK_LAYER_KHRONOS_validation yok — cull yolunun Mali denetimi kosmadi");
+    // Katman neden yok? IKI COK FARKLI SEBEP, eskiden tek mesaja sikistirilmisti:
+    //   (a) katman kurulu degil                     -> ortam eksigi
+    //   (b) loader ATLANDI (macOS dogrudan MoltenVK) -> katman zinciri YOK,
+    //       VK_LAYER_PATH ne derse desin hicbir sey degismez
+    // (b) bir ORTAM EKSIGI DEGIL, motorun kendi yolu. CI kapisi ikisini
+    // ayirt edebilsin diye metinler AYRI (olculdu CI macOS 2026-09-20).
+    if (dev.caps().loader_bypassed)
+      skip("loader ATLANDI (dogrudan MoltenVK) — katman zinciri YOK; cull yolunun Mali denetimi kosmadi");
+    else
+      skip("VK_LAYER_KHRONOS_validation yok — cull yolunun Mali denetimi kosmadi");
     dev.shutdown();
     return;
   }
