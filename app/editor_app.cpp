@@ -42,6 +42,7 @@
 #include "content/voxel.hpp"
 #include "content/water_wave.hpp"
 #include "core/jobs/job_system.hpp"
+#include "core/math/noise.hpp"
 #include "core/memory/arena.hpp"
 #include "core/profiler/profiler.hpp"
 #include "platform/memory.hpp"   // os_page_size (RSS hesabi)
@@ -345,6 +346,34 @@ struct RenderSettings {
   bool jitter = kRenderDefaults.temporal.jitter;
 };
 
+enum class TerrainBrushMode : uint8_t {
+  Yukselt = 0, // Raise
+  Alcalt,      // Lower
+  Duzlestir,   // Flatten
+  Yumusat,     // Smooth
+  Gurultu,     // Noise
+  Teras        // Terrace
+};
+
+struct TerrainSculptLayer {
+  float *deltas = nullptr;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t version = 0;
+};
+
+struct TerrainBrushSettings {
+  TerrainBrushMode mode = TerrainBrushMode::Yukselt;
+  float radius = 8.0f;
+  float strength = 1.0f;
+  float target_height = 5.0f;
+  float terrace_step = 2.0f;
+  bool active = false; // 3D gorunumde fircayla boyama acik/kapali
+  Vec3 hit_world{0, 0, 0};
+  Vec3 hit_local{0, 0, 0};
+  bool hit_valid = false;
+};
+
 struct EditorState {
   SceneDesc scene;
   content::SceneHistory hist;
@@ -376,6 +405,10 @@ struct EditorState {
   uint32_t terrain_hash[content::kSceneMaxEntities] = {};
   uint32_t voxel_hash[content::kSceneMaxEntities] = {};
   uint32_t water_hash[content::kSceneMaxEntities] = {};
+  // Arazi heykeltiras (sculpt) fircalari ve degisiklik katmani
+  TerrainBrushSettings terrain_brush;
+  TerrainSculptLayer terrain_sculpt[content::kSceneMaxEntities] = {};
+  Arena sculpt_arena;
   // Malzemeler ACILISTA kurulur. create_material kare icinde cagrilirsa
   // "kare basina 0 ayirma" kapisi duser (scene_runtime.cpp ayni notu tasiyor).
   renderer::MaterialHandle terrain_mat{}, voxel_mat{}, water_mat{}, sun_mat{}, light_core_mat{}, beam_mat{};
@@ -607,9 +640,15 @@ void proc_refresh(EditorState &st, renderer::Renderer &ren, uint32_t i) {
     cfg.frequency = e.terrain_freq;
     cfg.octaves = e.terrain_octaves;
     cfg.seed = e.terrain_seed;
-    const uint32_t h = proc_hash(&cfg, sizeof cfg);
+    const uint32_t sculpt_ver = st.terrain_sculpt[i].version;
+    const uint32_t h = proc_hash(&cfg, sizeof cfg) ^ (sculpt_ver * 0x9e3779b9u);
     if (h != st.terrain_hash[i]) {
-      st.terrain_meshes[i] = content::make_terrain_mesh(st.proc_arena, ren, cfg);
+      const float *deltas = (st.terrain_sculpt[i].deltas &&
+                             st.terrain_sculpt[i].width == cfg.width &&
+                             st.terrain_sculpt[i].height == cfg.height)
+                                ? st.terrain_sculpt[i].deltas
+                                : nullptr;
+      st.terrain_meshes[i] = content::make_terrain_mesh(st.proc_arena, ren, cfg, deltas);
       st.proc_arena.reset_to(mark);
       st.terrain_hash[i] = h;
     }
@@ -646,6 +685,367 @@ void proc_refresh(EditorState &st, renderer::Renderer &ren, uint32_t i) {
     st.water_meshes[i] = renderer::MeshHandle{};
     st.water_hash[i] = 0;
   }
+}
+
+static float *get_or_create_terrain_deltas(EditorState &st, uint32_t ent_idx, uint32_t width, uint32_t height) {
+  if (ent_idx >= content::kSceneMaxEntities) return nullptr;
+  auto &sc = st.terrain_sculpt[ent_idx];
+  const uint32_t total = width * height;
+  if (sc.deltas && sc.width == width && sc.height == height) return sc.deltas;
+  if (st.sculpt_arena.capacity() == 0) return nullptr;
+  sc.deltas = st.sculpt_arena.alloc_array<float>(total);
+  if (!sc.deltas) return nullptr;
+  std::memset(sc.deltas, 0, total * sizeof(float));
+  sc.width = width;
+  sc.height = height;
+  sc.version = 0;
+  return sc.deltas;
+}
+
+static float sample_terrain_height_with_sculpt(const EditorState &st, uint32_t ent_idx, float lx, float lz) {
+  if (ent_idx >= st.scene.entity_count) return 0.0f;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width;
+  const uint32_t h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  if (w < 2 || h < 2) return 0.0f;
+
+  float gx = lx / cell;
+  float gz = lz / cell;
+  if (gx < 0.0f) gx = 0.0f;
+  if (gz < 0.0f) gz = 0.0f;
+  if (gx > (float)(w - 1)) gx = (float)(w - 1);
+  if (gz > (float)(h - 1)) gz = (float)(h - 1);
+
+  const uint32_t x0 = (uint32_t)std::floor(gx);
+  const uint32_t z0 = (uint32_t)std::floor(gz);
+  const uint32_t x1 = x0 + 1 < w ? x0 + 1 : x0;
+  const uint32_t z1 = z0 + 1 < h ? z0 + 1 : z0;
+  const float tx = gx - (float)x0;
+  const float tz = gz - (float)z0;
+
+  content::HeightmapConfig cfg;
+  cfg.width = w; cfg.height = h; cfg.cell_size = cell;
+  cfg.amplitude = e.terrain_amp; cfg.frequency = e.terrain_freq;
+  cfg.octaves = e.terrain_octaves; cfg.seed = e.terrain_seed;
+
+  auto get_h = [&](uint32_t x, uint32_t z) -> float {
+    const float nx = (float)x * cell * cfg.frequency;
+    const float nz = (float)z * cell * cfg.frequency;
+    float base = fbm_2d(nx, nz, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+    const auto &sc = st.terrain_sculpt[ent_idx];
+    if (sc.deltas && sc.width == w && sc.height == h) {
+      base += sc.deltas[z * w + x];
+    }
+    return base;
+  };
+
+  const float h00 = get_h(x0, z0);
+  const float h10 = get_h(x1, z0);
+  const float h01 = get_h(x0, z1);
+  const float h11 = get_h(x1, z1);
+
+  const float h0 = h00 * (1.0f - tx) + h10 * tx;
+  const float h1 = h01 * (1.0f - tx) + h11 * tx;
+  return h0 * (1.0f - tz) + h1 * tz;
+}
+
+static void apply_terrain_brush(EditorState &st, renderer::Renderer &ren, uint32_t ent_idx, float center_lx, float center_lz, float dt, bool invert = false) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  if (!(e.components & content::kSceneTerrain)) return;
+  const uint32_t w = (uint32_t)e.terrain_width;
+  const uint32_t h = (uint32_t)e.terrain_height;
+  if (w < 2 || h < 2) return;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  const float rad = st.terrain_brush.radius > 0.1f ? st.terrain_brush.radius : 1.0f;
+  const float str = st.terrain_brush.strength;
+  TerrainBrushMode mode = st.terrain_brush.mode;
+  if (invert) {
+    if (mode == TerrainBrushMode::Yukselt) mode = TerrainBrushMode::Alcalt;
+    else if (mode == TerrainBrushMode::Alcalt) mode = TerrainBrushMode::Yukselt;
+  }
+
+  const float step_dt = dt > 0.0f ? dt : 0.05f;
+  const float pi = 3.14159265358979323846f;
+
+  content::HeightmapConfig cfg;
+  cfg.width = w; cfg.height = h; cfg.cell_size = cell;
+  cfg.amplitude = e.terrain_amp; cfg.frequency = e.terrain_freq;
+  cfg.octaves = e.terrain_octaves; cfg.seed = e.terrain_seed;
+
+  const int min_x = (int)std::floor((center_lx - rad) / cell);
+  const int max_x = (int)std::ceil((center_lx + rad) / cell);
+  const int min_z = (int)std::floor((center_lz - rad) / cell);
+  const int max_z = (int)std::ceil((center_lz + rad) / cell);
+
+  const int cl_min_x = min_x < 0 ? 0 : min_x;
+  const int cl_max_x = max_x >= (int)w ? (int)w - 1 : max_x;
+  const int cl_min_z = min_z < 0 ? 0 : min_z;
+  const int cl_max_z = max_z >= (int)h ? (int)h - 1 : max_z;
+
+  for (int z = cl_min_z; z <= cl_max_z; z++) {
+    for (int x = cl_min_x; x <= cl_max_x; x++) {
+      const float vx = (float)x * cell;
+      const float vz = (float)z * cell;
+      const float dx = vx - center_lx;
+      const float dz = vz - center_lz;
+      const float dist = std::sqrt(dx * dx + dz * dz);
+      if (dist > rad) continue;
+      const float falloff = 0.5f * (1.0f + std::cos((dist / rad) * pi));
+      const uint32_t idx = (uint32_t)(z * w + x);
+
+      const float nx = (float)x * cell * cfg.frequency;
+      const float nz = (float)z * cell * cfg.frequency;
+      const float base_h = fbm_2d(nx, nz, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+      const float cur_h = base_h + deltas[idx];
+
+      switch (mode) {
+        case TerrainBrushMode::Yukselt: {
+          deltas[idx] += str * falloff * 10.0f * step_dt;
+          break;
+        }
+        case TerrainBrushMode::Alcalt: {
+          deltas[idx] -= str * falloff * 10.0f * step_dt;
+          break;
+        }
+        case TerrainBrushMode::Duzlestir: {
+          const float target = st.terrain_brush.target_height;
+          const float diff = target - cur_h;
+          deltas[idx] += diff * falloff * std::min(1.0f, str * 6.0f * step_dt);
+          break;
+        }
+        case TerrainBrushMode::Yumusat: {
+          float sum = 0.0f;
+          int count = 0;
+          for (int oz = -1; oz <= 1; oz++) {
+            for (int ox = -1; ox <= 1; ox++) {
+              const int nx_i = x + ox, nz_i = z + oz;
+              if (nx_i >= 0 && nx_i < (int)w && nz_i >= 0 && nz_i < (int)h) {
+                const uint32_t nidx = (uint32_t)(nz_i * w + nx_i);
+                const float n_base = fbm_2d((float)nx_i * cell * cfg.frequency, (float)nz_i * cell * cfg.frequency, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+                sum += n_base + deltas[nidx];
+                count++;
+              }
+            }
+          }
+          if (count > 0) {
+            const float avg = sum / (float)count;
+            const float diff = avg - cur_h;
+            deltas[idx] += diff * falloff * std::min(1.0f, str * 8.0f * step_dt);
+          }
+          break;
+        }
+        case TerrainBrushMode::Gurultu: {
+          const float nval = (value_noise_2d((float)x * 0.45f, (float)z * 0.45f, cfg.seed + 991) - 0.5f) * 2.0f;
+          deltas[idx] += nval * str * falloff * 8.0f * step_dt;
+          break;
+        }
+        case TerrainBrushMode::Teras: {
+          const float step = st.terrain_brush.terrace_step > 0.1f ? st.terrain_brush.terrace_step : 2.0f;
+          const float target = std::round(cur_h / step) * step;
+          const float diff = target - cur_h;
+          deltas[idx] += diff * falloff * std::min(1.0f, str * 6.0f * step_dt);
+          break;
+        }
+      }
+    }
+  }
+
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  proc_refresh(st, ren, ent_idx);
+  st.dirty = true;
+}
+
+static void stamp_raise_mountain(EditorState &st, renderer::Renderer &ren, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const float cx = (float)w * cell * 0.5f, cz = (float)h * cell * 0.5f;
+  const float rad = (float)std::min(w, h) * cell * 0.42f;
+  const float pi = 3.14159265358979323846f;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float vx = (float)x * cell, vz = (float)z * cell;
+      const float dist = std::sqrt((vx - cx) * (vx - cx) + (vz - cz) * (vz - cz));
+      if (dist < rad) {
+        const float falloff = 0.5f * (1.0f + std::cos((dist / rad) * pi));
+        deltas[z * w + x] += 12.0f * falloff;
+      }
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  proc_refresh(st, ren, ent_idx);
+  st.dirty = true;
+  set_status(st, "arazi: tepe/zirve kabartildi (+12m)");
+}
+
+static void stamp_carve_crater(EditorState &st, renderer::Renderer &ren, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const float cx = (float)w * cell * 0.5f, cz = (float)h * cell * 0.5f;
+  const float rad = (float)std::min(w, h) * cell * 0.38f;
+  const float pi = 3.14159265358979323846f;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float vx = (float)x * cell, vz = (float)z * cell;
+      const float dist = std::sqrt((vx - cx) * (vx - cx) + (vz - cz) * (vz - cz));
+      if (dist < rad) {
+        const float u = dist / rad;
+        if (u < 0.65f) {
+          const float depth_falloff = 0.5f * (1.0f + std::cos((u / 0.65f) * pi));
+          deltas[z * w + x] -= 8.0f * depth_falloff;
+        } else {
+          const float rim = std::sin(((u - 0.65f) / 0.35f) * pi);
+          deltas[z * w + x] += 3.5f * rim;
+        }
+      }
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  proc_refresh(st, ren, ent_idx);
+  st.dirty = true;
+  set_status(st, "arazi: krater/cukur kazildi");
+}
+
+static void stamp_flatten_plateau(EditorState &st, renderer::Renderer &ren, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const float cx = (float)w * cell * 0.5f, cz = (float)h * cell * 0.5f;
+  const float rad = (float)std::min(w, h) * cell * 0.35f;
+  const float pi = 3.14159265358979323846f;
+  const float target = st.terrain_brush.target_height;
+  content::HeightmapConfig cfg;
+  cfg.width = w; cfg.height = h; cfg.cell_size = cell;
+  cfg.amplitude = e.terrain_amp; cfg.frequency = e.terrain_freq;
+  cfg.octaves = e.terrain_octaves; cfg.seed = e.terrain_seed;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float vx = (float)x * cell, vz = (float)z * cell;
+      const float dist = std::sqrt((vx - cx) * (vx - cx) + (vz - cz) * (vz - cz));
+      if (dist < rad) {
+        const float falloff = 0.5f * (1.0f + std::cos((dist / rad) * pi));
+        const float nx = (float)x * cell * cfg.frequency;
+        const float nz = (float)z * cell * cfg.frequency;
+        const float base_h = fbm_2d(nx, nz, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+        const float cur_h = base_h + deltas[z * w + x];
+        deltas[z * w + x] += (target - cur_h) * falloff;
+      }
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  proc_refresh(st, ren, ent_idx);
+  st.dirty = true;
+  set_status(st, "arazi: zirve platosu duzlestirildi (%.1f m)", target);
+}
+
+static void stamp_smooth_erosion(EditorState &st, renderer::Renderer &ren, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const size_t mark = st.proc_arena.mark();
+  float *temp = st.proc_arena.alloc_array<float>(w * h);
+  if (temp) {
+    std::memcpy(temp, deltas, w * h * sizeof(float));
+    for (uint32_t z = 1; z + 1 < h; z++) {
+      for (uint32_t x = 1; x + 1 < w; x++) {
+        float sum = 0.0f;
+        for (int oz = -1; oz <= 1; oz++) {
+          for (int ox = -1; ox <= 1; ox++) {
+            sum += temp[(z + oz) * w + (x + ox)];
+          }
+        }
+        deltas[z * w + x] = sum / 9.0f;
+      }
+    }
+    st.proc_arena.reset_to(mark);
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  proc_refresh(st, ren, ent_idx);
+  st.dirty = true;
+  set_status(st, "arazi: erozyon yumusatmasi uygulandi");
+}
+
+static void stamp_add_rock_noise(EditorState &st, renderer::Renderer &ren, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float n = (value_noise_2d((float)x * 0.7f, (float)z * 0.7f, 1337) - 0.5f) * 2.0f;
+      deltas[z * w + x] += n * 1.5f;
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  proc_refresh(st, ren, ent_idx);
+  st.dirty = true;
+  set_status(st, "arazi: kayalik mikro puruzler basildi");
+}
+
+static void stamp_terrace_steps(EditorState &st, renderer::Renderer &ren, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const float step = st.terrain_brush.terrace_step > 0.1f ? st.terrain_brush.terrace_step : 2.5f;
+  content::HeightmapConfig cfg;
+  cfg.width = w; cfg.height = h; cfg.cell_size = cell;
+  cfg.amplitude = e.terrain_amp; cfg.frequency = e.terrain_freq;
+  cfg.octaves = e.terrain_octaves; cfg.seed = e.terrain_seed;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float nx = (float)x * cell * cfg.frequency;
+      const float nz = (float)z * cell * cfg.frequency;
+      const float base_h = fbm_2d(nx, nz, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+      const float cur_h = base_h + deltas[z * w + x];
+      const float stepped = std::round(cur_h / step) * step;
+      deltas[z * w + x] += (stepped - cur_h) * 0.7f;
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  proc_refresh(st, ren, ent_idx);
+  st.dirty = true;
+  set_status(st, "arazi: basamakli teraslama uygulandi (%.1f m)", step);
+}
+
+static void stamp_reset_sculpt(EditorState &st, renderer::Renderer &ren, uint32_t ent_idx) {
+  if (ent_idx >= content::kSceneMaxEntities) return;
+  auto &sc = st.terrain_sculpt[ent_idx];
+  if (sc.deltas) {
+    std::memset(sc.deltas, 0, sc.width * sc.height * sizeof(float));
+  }
+  sc.version++;
+  st.terrain_hash[ent_idx] = 0;
+  proc_refresh(st, ren, ent_idx);
+  st.dirty = true;
+  set_status(st, "arazi: tum heykeltiras/firca degisiklikleri sifirlandi");
 }
 
 // Ayrik widget (onay kutusu, secim): kopya uzerinde degisiklik, hemen islem.
@@ -771,6 +1171,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
   // onizleme sessizce degil, KONSOLA yazarak kapanir.
   if (!sys.carve(st.proc_arena, 64u << 20, "editor_proc_mesh", OverflowPolicy::ReturnNull))
     console_log(ConsoleLevel::Uyari, kConsoleTagEditor, "prosedurel onizleme arenasi ayrilamadi: arazi/su/voksel cizilmeyecek");
+  if (!sys.carve(st.sculpt_arena, 16u << 20, "editor_sculpt", OverflowPolicy::ReturnNull))
+    console_log(ConsoleLevel::Uyari, kConsoleTagEditor, "sculpt arenasi ayrilamadi: arazi sekillendirme kullanilamayacak");
   // Ilkel mesh tablosu: SAHNEDEN BAGIMSIZ, salt geometri, bir kez kurulur.
   // SceneRuntime de AYNI fonksiyonu cagirir -- kapsul/silindir/koni/dortgen/
   // simit editorde ve derlenmis oyunda ayni geometriyi gosterir.
@@ -3076,24 +3478,20 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
 
                 ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 H\xC3\xBCzme \xC3\x96nayarlar\xC4\xB1:");
                 ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
-                if (ImGui::SmallButton("Hafif / Duman")) {
-                  after = e; after.light_godray_intensity = 0.12f; commit(st, si, after);
-                  st.scene.godray_density = 0.35f; st.scene.godray_weight = 0.25f; st.scene.godray_decay = 0.90f; st.scene.godray_exposure = 0.15f; st.dirty = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Do\xC4\x9F" "al")) {
-                  after = e; after.light_godray_intensity = 0.5f; commit(st, si, after);
-                  st.scene.godray_density = 0.7f; st.scene.godray_weight = 0.45f; st.scene.godray_decay = 0.94f; st.scene.godray_exposure = 0.25f; st.dirty = true;
+                if (ImGui::SmallButton("Do\xC4\x9F" "al G\xC3\xBCne\xC5\x9F")) {
+                  st.scene.godray_density = 0.8f; st.scene.godray_weight = 0.5f; st.scene.godray_decay = 0.95f; st.scene.godray_exposure = 0.3f; st.dirty = true;
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Dramatik")) {
-                  after = e; after.light_godray_intensity = 1.2f; commit(st, si, after);
-                  st.scene.godray_density = 1.1f; st.scene.godray_weight = 0.65f; st.scene.godray_decay = 0.97f; st.scene.godray_exposure = 0.40f; st.dirty = true;
+                  st.scene.godray_density = 1.2f; st.scene.godray_weight = 0.7f; st.scene.godray_decay = 0.97f; st.scene.godray_exposure = 0.5f; st.dirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Hafif Sis")) {
+                  st.scene.godray_density = 0.5f; st.scene.godray_weight = 0.3f; st.scene.godray_decay = 0.92f; st.scene.godray_exposure = 0.2f; st.dirty = true;
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Sinematik")) {
-                  after = e; after.light_godray_intensity = 2.0f; commit(st, si, after);
-                  st.scene.godray_density = 1.4f; st.scene.godray_weight = 0.8f; st.scene.godray_decay = 0.98f; st.scene.godray_exposure = 0.55f; st.dirty = true;
+                  st.scene.godray_density = 1.4f; st.scene.godray_weight = 0.8f; st.scene.godray_decay = 0.98f; st.scene.godray_exposure = 0.6f; st.dirty = true;
                 }
                 ImGui::PopStyleVar();
               }
@@ -3202,6 +3600,90 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
 
               prop_end();
             }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::TextColored(tone(Tone::AxisY), ICON_MD_BRUSH " Arazi \xC5\x9E" "ekillendirme F\xC4\xB1r\xC3\xA7" "alar\xC4\xB1 (Sculpt)");
+
+            // 3D Viewport Paint toggle button
+            const bool brush_active = st.terrain_brush.active;
+            if (brush_active) {
+              ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.55f, 0.32f, 1.0f));
+              ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.65f, 0.38f, 1.0f));
+              if (ImGui::Button(ICON_MD_CHECK " 3D G\xC3\xB6r\xC3\xBCn\xC3\xBCmde F\xC4\xB1r\xC3\xA7" "a: A\xC3\x87IK", ImVec2(-1, 26))) {
+                st.terrain_brush.active = false;
+              }
+              ImGui::PopStyleColor(2);
+              ImGui::TextDisabled("Sol t\xC4\xB1kla boya | Shift: ters y\xC3\xB6n");
+            } else {
+              if (ImGui::Button(ICON_MD_BRUSH " 3D G\xC3\xB6r\xC3\xBCn\xC3\xBCmde F\xC4\xB1r\xC3\xA7" "ay\xC4\xB1 Etkinle\xC5\x9Ftir", ImVec2(-1, 26))) {
+                st.terrain_brush.active = true;
+              }
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("F\xC4\xB1r\xC3\xA7" "a Modu:");
+
+            auto mode_btn = [&](const char *label, TerrainBrushMode m) {
+              const bool is_sel = (st.terrain_brush.mode == m);
+              if (is_sel) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.45f, 0.72f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.55f, 0.82f, 1.0f));
+              }
+              const float w = (ImGui::GetContentRegionAvail().x - 8.0f) / 3.0f;
+              if (ImGui::Button(label, ImVec2(w, 24))) {
+                st.terrain_brush.mode = m;
+              }
+              if (is_sel) ImGui::PopStyleColor(2);
+            };
+
+            mode_btn("Y\xC3\xBCkselt", TerrainBrushMode::Yukselt); ImGui::SameLine();
+            mode_btn("Al\xC3\xA7" "alt", TerrainBrushMode::Alcalt); ImGui::SameLine();
+            mode_btn("D\xC3\xBCzle\xC5\x9Ftir", TerrainBrushMode::Duzlestir);
+
+            mode_btn("Yumu\xC5\x9F" "at", TerrainBrushMode::Yumusat); ImGui::SameLine();
+            mode_btn("G\xC3\xBCr\xC3\xBClt\xC3\xBC", TerrainBrushMode::Gurultu); ImGui::SameLine();
+            mode_btn("Teras", TerrainBrushMode::Teras);
+
+            if (prop_begin("arazi_firca_ayarlar")) {
+              prop_float("F\xC4\xB1r\xC3\xA7" "a Yar\xC4\xB1\xC3\xA7" "ap\xC4\xB1", &st.terrain_brush.radius, 0.5f, 1.0f, 100.0f, "%.1f m");
+              prop_float("F\xC4\xB1r\xC3\xA7" "a G\xC3\xBC" "c\xC3\xBC", &st.terrain_brush.strength, 0.05f, 0.05f, 5.0f, "%.2f");
+              if (st.terrain_brush.mode == TerrainBrushMode::Duzlestir) {
+                prop_float("Hedef Y\xC3\xBCkseklik", &st.terrain_brush.target_height, 0.2f, -50.0f, 200.0f, "%.1f m");
+              }
+              if (st.terrain_brush.mode == TerrainBrushMode::Teras) {
+                prop_float("Basamak Aral\xC4\xB1\xC4\x9F\xC4\xB1", &st.terrain_brush.terrace_step, 0.1f, 0.5f, 20.0f, "%.1f m");
+              }
+              prop_end();
+            }
+
+            if (st.terrain_brush.mode == TerrainBrushMode::Duzlestir && st.terrain_brush.hit_valid) {
+              if (ImGui::SmallButton("Son \xC4\xB0\xC5\x9F" "aretlenen Y\xC3\xBCksekli\xC4\x9Fi Hedef Al")) {
+                st.terrain_brush.target_height = st.terrain_brush.hit_local.y;
+              }
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 \xC5\x9E" "ekillendirme Damgalar\xC4\xB1:");
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+            if (ImGui::SmallButton("Tepe Kabart")) stamp_raise_mountain(st, ren, (uint32_t)si);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Krater Kaz")) stamp_carve_crater(st, ren, (uint32_t)si);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Plato D\xC3\xBCzle")) stamp_flatten_plateau(st, ren, (uint32_t)si);
+
+            if (ImGui::SmallButton("Yumu\xC5\x9F" "at")) stamp_smooth_erosion(st, ren, (uint32_t)si);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Kayal\xC4\xB1k")) stamp_add_rock_noise(st, ren, (uint32_t)si);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Terasla")) stamp_terrace_steps(st, ren, (uint32_t)si);
+
+            ImGui::Spacing();
+            if (ImGui::SmallButton(ICON_MD_REFRESH " De\xC4\x9Fi\xC5\x9Fiklikleri S\xC4\xB1" "f\xC4\xB1rla")) stamp_reset_sculpt(st, ren, (uint32_t)si);
+            ImGui::PopStyleVar();
+
             end_component_card();
           }
           process_component_card_action(act, content::kSceneTerrain, e, si, [&](int idx, const SceneEntity &se) { commit(st, idx, se); });
@@ -3792,10 +4274,10 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       const ImGuizmo::OPERATION op = gizmo_op == 0 ? ImGuizmo::TRANSLATE : gizmo_op == 1 ? ImGuizmo::ROTATE : ImGuizmo::SCALE;
       const float snap_vec[3] = {snap_step, snap_step, snap_step};
       ImGuizmo::SetOrthographic(cam.proj == CameraProjection::Ortho);
-      const bool changed = ImGuizmo::Manipulate(&view.m[0][0], &proj_gl.m[0][0], op,
+      const bool changed = !st.terrain_brush.active ? ImGuizmo::Manipulate(&view.m[0][0], &proj_gl.m[0][0], op,
                                                 gizmo_space == GizmoSpace::Local ? ImGuizmo::LOCAL : ImGuizmo::WORLD, &mtx.m[0][0], nullptr,
-                                                snap_on ? snap_vec : nullptr);
-      const bool using_now = ImGuizmo::IsUsing();
+                                                snap_on ? snap_vec : nullptr) : false;
+      const bool using_now = !st.terrain_brush.active && ImGuizmo::IsUsing();
       // --- KAPININ KAPISI: sentetik girdi GERCEKTEN ImGui'ye ulasti mi? -----
       // Surukleme kapisi kirmizi yaninca iki aciklama var: (a) gizmo bozuk,
       // (b) sentetik fare ImGui'ye hic varmadi ve kapi yalniz kendi tesisatini
@@ -3897,6 +4379,114 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       const ViewportPick pick = in ? vp.map_mouse(view_rect, (float)in->mouse_x * psc, (float)in->mouse_y * psc) : ViewportPick{};
       // Gizmo kullaniliyorsa (veya az once birakildiysa) marquee secimi iptal.
       const bool gizmo_active_or_just_finished = ImGuizmo::IsUsing() || st.gizmo_was_over;
+
+      const int32_t t_prim = st.sel.primary();
+      if (view_tab == ViewportTab::Scene && t_prim >= 0 && t_prim < (int32_t)st.scene.entity_count &&
+          (st.scene.entities[t_prim].components & content::kSceneTerrain)) {
+        const SceneEntity &te = st.scene.entities[t_prim];
+        Vec3 ro, rd;
+        camera_ray(cam, aspect, pick.valid ? pick.x : (float)vp.width() * 0.5f, pick.valid ? pick.y : (float)vp.height() * 0.5f, (float)vp.width(), (float)vp.height(), &ro, &rd);
+        const Mat4 tw = content::scene_entity_world_matrix(st.scene, (uint32_t)t_prim);
+        const Mat4 inv_tw = inverse(tw);
+        const Vec4 ro_loc4 = inv_tw * Vec4{ro.x, ro.y, ro.z, 1.0f};
+        const Vec4 rd_loc4 = inv_tw * Vec4{rd.x, rd.y, rd.z, 0.0f};
+        const Vec3 ro_loc{ro_loc4.x, ro_loc4.y, ro_loc4.z};
+        const Vec3 rd_loc = normalize(Vec3{rd_loc4.x, rd_loc4.y, rd_loc4.z});
+
+        const float tw_world = te.terrain_width * te.terrain_cell;
+        const float th_world = te.terrain_height * te.terrain_cell;
+
+        bool hit = false;
+        Vec3 hit_loc{0, 0, 0};
+
+        if (std::fabs(rd_loc.y) > 1e-5f) {
+          float t0 = 0.0f, t1 = 300.0f;
+          float step_sz = (t1 - t0) / 24.0f;
+          float prev_diff = 0.0f;
+          Vec3 prev_p = ro_loc;
+          for (int s = 0; s <= 24; s++) {
+            float t = t0 + (float)s * step_sz;
+            Vec3 p = ro_loc + rd_loc * t;
+            if (p.x >= 0.0f && p.x <= tw_world && p.z >= 0.0f && p.z <= th_world) {
+              float surf_h = sample_terrain_height_with_sculpt(st, (uint32_t)t_prim, p.x, p.z);
+              float diff = p.y - surf_h;
+              if (s > 0 && ((diff <= 0.0f && prev_diff >= 0.0f) || (diff >= 0.0f && prev_diff <= 0.0f))) {
+                float frac = std::fabs(prev_diff) / (std::fabs(prev_diff) + std::fabs(diff) + 1e-6f);
+                hit_loc = prev_p + (p - prev_p) * frac;
+                hit = true;
+                break;
+              }
+              prev_diff = diff;
+              prev_p = p;
+            }
+          }
+          if (!hit && rd_loc.y < -0.001f) {
+            float tp = (te.terrain_amp * 0.3f - ro_loc.y) / rd_loc.y;
+            if (tp > 0.0f) {
+              Vec3 p = ro_loc + rd_loc * tp;
+              if (p.x >= 0.0f && p.x <= tw_world && p.z >= 0.0f && p.z <= th_world) {
+                hit_loc = p;
+                hit_loc.y = sample_terrain_height_with_sculpt(st, (uint32_t)t_prim, p.x, p.z);
+                hit = true;
+              }
+            }
+          }
+        }
+
+        if (hit) {
+          st.terrain_brush.hit_valid = true;
+          st.terrain_brush.hit_local = hit_loc;
+          const Vec4 hw4 = tw * Vec4{hit_loc.x, hit_loc.y, hit_loc.z, 1.0f};
+          st.terrain_brush.hit_world = Vec3{hw4.x, hw4.y, hw4.z};
+
+          if (st.terrain_brush.active && pick.valid) {
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            const Mat4 vp_mat = proj * view;
+            const float rad = st.terrain_brush.radius;
+            constexpr int kSegs = 36;
+            ImVec2 pts[kSegs];
+            bool pts_valid[kSegs];
+            for (int s = 0; s < kSegs; s++) {
+              const float ang = (float)s * (2.0f * 3.14159265f / (float)kSegs);
+              const float lx = hit_loc.x + rad * std::cos(ang);
+              const float lz = hit_loc.z + rad * std::sin(ang);
+              const float ly = sample_terrain_height_with_sculpt(st, (uint32_t)t_prim, lx, lz) + 0.08f;
+              const Vec4 wpos = tw * Vec4{lx, ly, lz, 1.0f};
+              const Vec4 clip = vp_mat * wpos;
+              if (clip.w > 0.01f) {
+                const float ndc_x = clip.x / clip.w;
+                const float ndc_y = clip.y / clip.w;
+                const float sx = view_rect.x + (ndc_x * 0.5f + 0.5f) * view_rect.w;
+                const float sy = view_rect.y + (ndc_y * 0.5f + 0.5f) * view_rect.h;
+                pts[s] = ImVec2(sx, sy);
+                pts_valid[s] = true;
+              } else {
+                pts_valid[s] = false;
+              }
+            }
+            const ImU32 col_ring = IM_COL32(50, 235, 150, 240);
+            for (int s = 0; s < kSegs; s++) {
+              int s_next = (s + 1) % kSegs;
+              if (pts_valid[s] && pts_valid[s_next]) {
+                dl->AddLine(pts[s], pts[s_next], col_ring, 2.5f);
+              }
+            }
+            const Vec4 clip_center = vp_mat * Vec4{st.terrain_brush.hit_world.x, st.terrain_brush.hit_world.y + 0.1f, st.terrain_brush.hit_world.z, 1.0f};
+            if (clip_center.w > 0.01f) {
+              const float cx = view_rect.x + (clip_center.x / clip_center.w * 0.5f + 0.5f) * view_rect.w;
+              const float cy = view_rect.y + (clip_center.y / clip_center.w * 0.5f + 0.5f) * view_rect.h;
+              dl->AddCircleFilled(ImVec2(cx, cy), 4.0f, col_ring);
+            }
+
+            if (view_hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+              apply_terrain_brush(st, ren, (uint32_t)t_prim, hit_loc.x, hit_loc.z, dt, ImGui::GetIO().KeyShift);
+            }
+          }
+        } else {
+          st.terrain_brush.hit_valid = false;
+        }
+      }
+
       if (view_tab == ViewportTab::Scene && ovres.box_done && !gizmo_active_or_just_finished) {
         // Kutu (marquee) secim: kaplama dikdortgeni verdi, izdusum testi saf
         // fonksiyonda (kamera ARKASINDAKI kutular orada eleniyor).
@@ -3912,7 +4502,7 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
           if (!st.sel.contains(ent)) st.sel.toggle(ent);
         }
         set_status(st, "kutu secim: %u varlik", st.sel.count);
-      } else if (view_tab == ViewportTab::Scene && pressed && pick.valid && view_hovered && !ovres.consumed_mouse && !ImGuizmo::IsUsing() && !ImGuizmo::IsOver()) {
+      } else if (view_tab == ViewportTab::Scene && pressed && pick.valid && view_hovered && !ovres.consumed_mouse && !ImGuizmo::IsUsing() && !ImGuizmo::IsOver() && !st.terrain_brush.active) {
         static content::SceneBounds wb[content::kSceneMaxEntities];
         static int32_t wmap[content::kSceneMaxEntities];
         const uint32_t nb = entity_pick_bounds(st, phys, wb, wmap); // gizliler DISARIDA
@@ -4534,31 +5124,32 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         cone_m.m[3][2] = center.z;
         cone_m.m[3][3] = 1.0f;
 
-        // Hacimsel huzmenin parlakligini kullanicinin sectigi huzme gucu (intensity),
-        // yogunluk (density) ve pozlama (exposure) ile birebir dinamik olcekleyelim:
-        float beam_lum = (e.light_godray_intensity * 0.35f) * (st.scene.godray_density * 0.5f) * (st.scene.godray_exposure * 1.6f);
-        if (beam_lum < 0.001f) beam_lum = 0.001f;
-        renderer::PbrParams bp;
-        bp.metallic = 0.0f;
-        bp.roughness = 1.0f;
-        bp.emissive = e.light_color * beam_lum;
-        ren.set_material_pbr(st.beam_mat, bp);
-
-        ren.draw(st.prims[content::kPrimCone], st.beam_mat, cone_m, e.light_color);
+        Vec3 beam_col = e.light_color * (e.light_godray_intensity * 0.85f);
+        ren.draw(st.prims[content::kPrimCone], st.beam_mat, cone_m, beam_col);
       }
     }
-    // --- Gunes diski (yalnizca gokyuzundeki directional sun icin) ---
-    // Spot ve kapali alan isiklarinda 3B koni zaten ciziliyor; lamba tepesine
-    // kor edici yapay kure basmayarak huzmenin dogal ve seffaf gorunmesini saglar.
-    if (st.scene.godrays_enabled && gr_intensity > 0.0f && gr_source.w == 0.0f && st.prims[content::kPrimSphere].valid()) {
-      Vec3 sun_d = normalize(Vec3{gr_source.x, gr_source.y, gr_source.z});
-      Vec3 to_sun = {-sun_d.x, -sun_d.y, -sun_d.z};
-      Vec3 eye = camera_eye(cam);
-      float sun_dist = 150.0f; // zfar (200.0f) onunde, sahne nesnelerinin arkasinda
-      Vec3 sun_pos = eye + to_sun * sun_dist;
-      float sun_radius = sun_dist * 0.09f; // dogal gokyuzu gunes diski
-      Mat4 sun_m = Mat4::translate(sun_pos) * Mat4::scale(Vec3{sun_radius, sun_radius, sun_radius});
-      ren.draw(st.prims[content::kPrimSphere], st.sun_mat, sun_m, Vec3{1.0f, 0.96f, 0.88f});
+    // --- RDR2 tarzi sinematik isik huzmesi (God Rays) cekirdek cizimi --------
+    // Sahnedeki engellerin (duvar, kutu) gunesi fiziksel olarak perdelemesi ve
+    // arkasindan gercek isik saftlari akmasi icin sahne derinlik testine tabi
+    // parlak bir gunes/isik cekirdegi cizilir.
+    if (st.scene.godrays_enabled && gr_intensity > 0.0f && st.prims[content::kPrimSphere].valid()) {
+      if (gr_source.w == 0.0f) {
+        // Yonlu gunes isigi (directional sun)
+        Vec3 sun_d = normalize(Vec3{gr_source.x, gr_source.y, gr_source.z});
+        Vec3 to_sun = {-sun_d.x, -sun_d.y, -sun_d.z};
+        Vec3 eye = camera_eye(cam);
+        float sun_dist = 150.0f; // zfar (200.0f) onunde, sahne nesnelerinin arkasinda
+        Vec3 sun_pos = eye + to_sun * sun_dist;
+        float sun_radius = sun_dist * 0.09f; // dogal gokyuzu gunes diski
+        Mat4 sun_m = Mat4::translate(sun_pos) * Mat4::scale(Vec3{sun_radius, sun_radius, sun_radius});
+        ren.draw(st.prims[content::kPrimSphere], st.sun_mat, sun_m, Vec3{1.0f, 0.96f, 0.88f});
+      } else {
+        // Nokta ya da spot isik (point / spot light)
+        Vec3 light_pos = {gr_source.x, gr_source.y, gr_source.z};
+        float core_radius = 0.35f;
+        Mat4 core_m = Mat4::translate(light_pos) * Mat4::scale(Vec3{core_radius, core_radius, core_radius});
+        ren.draw(st.prims[content::kPrimSphere], st.light_core_mat, core_m, Vec3{1.0f, 1.0f, 1.0f});
+      }
     }
     // Isik yaricapi / golge hacmi / gunes yonu: motorun kendi draw'u ile ince kutular.
     // --- Gorunum kipi kaplamalari -------------------------------------------

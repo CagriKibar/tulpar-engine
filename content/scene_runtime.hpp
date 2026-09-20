@@ -31,7 +31,7 @@ namespace tulpar::engine::content {
 // `tmp` GECICI alandir: cagiran mark() alir, cagriyi yapar, reset_to() ile
 // geri sarar; kalici olan yalniz GPU tarafi. Yer yetmezse ya da olcu gecersizse
 // GECERSIZ MeshHandle doner (cagiran valid() ile bakar) -- sessiz bos mesh yok.
-renderer::MeshHandle make_terrain_mesh(Arena &tmp, renderer::Renderer &r, const HeightmapConfig &cfg);
+renderer::MeshHandle make_terrain_mesh(Arena &tmp, renderer::Renderer &r, const HeightmapConfig &cfg, const float *deltas = nullptr);
 renderer::MeshHandle make_voxel_mesh(Arena &tmp, renderer::Renderer &r, uint32_t nx, uint32_t ny, uint32_t nz, float cell);
 renderer::MeshHandle make_water_mesh(Arena &tmp, renderer::Renderer &r, const GerstnerWave &wave);
 

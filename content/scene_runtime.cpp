@@ -45,13 +45,18 @@ renderer::PbrParams pbr_of(const SceneBlobDraw &d) {
 // kopyadaki gerstner formulu YANLISTI (k * theta iki kez uygulaniyordu), yani
 // editorun suyu derlenmis sahnenin suyundan baska dalgalaniyordu.
 
-renderer::MeshHandle make_terrain_mesh(Arena &tmp, renderer::Renderer &r, const HeightmapConfig &cfg) {
+renderer::MeshHandle make_terrain_mesh(Arena &tmp, renderer::Renderer &r, const HeightmapConfig &cfg, const float *deltas) {
   if (cfg.width < 2 || cfg.height < 2) return renderer::MeshHandle{};
   const uint32_t nverts = cfg.width * cfg.height;
   float *heights = tmp.alloc_array<float>(nverts);
   renderer::Vertex *verts = tmp.alloc_array<renderer::Vertex>(nverts);
   if (!heights || !verts) return renderer::MeshHandle{};
   generate_heightmap(cfg, heights);
+  if (deltas) {
+    for (uint32_t j = 0; j < nverts; j++) {
+      heights[j] += deltas[j];
+    }
+  }
   for (uint32_t z = 0; z < cfg.height; z++) {
     for (uint32_t x = 0; x < cfg.width; x++) {
       const uint32_t i = z * cfg.width + x;

@@ -1125,6 +1125,9 @@ SceneBounds scene_entity_local_bounds(const SceneEntity &e, const SceneBounds *m
     if (e.shape == SceneShape::Box) grow(e.half * -1.0f, e.half);
     else grow({-e.radius, -e.radius, -e.radius}, {e.radius, e.radius, e.radius});
   }
+  if (e.components & kSceneTerrain) {
+    grow({0.0f, 0.0f, 0.0f}, {e.terrain_width * e.terrain_cell, e.terrain_amp, e.terrain_height * e.terrain_cell});
+  }
   return b;
 }
 SceneBounds scene_world_bounds(const SceneBounds &local, const Mat4 &m) {
