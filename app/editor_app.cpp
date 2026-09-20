@@ -2421,36 +2421,6 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       else if (tb > 0) do_add(tb);
       hierarchy_search(st.filter, sizeof st.filter);
 
-      if (ImGui::BeginPopupContextWindow("SahnePanelMenu", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
-        // Olustur agacinin TEK dogruluk kaynagi kCreateMenu (editor_widgets).
-        // Burada elle yazilmis IKINCI bir kopya vardi ve ayrismisti: kCreate3D
-        // uzun zamandir Kapsul/Silindir/Koni/Dortgen/Simit tasiyor, bu kopyada
-        // hicbiri yoktu. Ayrica iki emoji (U+1F3A5 kamera, U+1F50A hoparlor)
-        // DejaVuSans'ta YOK -- menude tofu kutusu ciziliyordu; tablo yalniz
-        // fontta gercekten bulunan glifleri kullaniyor.
-        if (ImGui::BeginMenu("Yeni Varl\xC4\xB1k Ekle")) {
-          const int r = create_menu_draw(kCreateMenu, kCreateMenuCount);
-          if (r) do_add(r);
-          ImGui::EndMenu();
-        }
-        if (ImGui::MenuItem(ICON_MD_WIDGETS " Prefab ekle...")) {
-          dlg_intent = IntentPrefabLoad;
-          file_dialog_open(dlg, FileDialogMode::Ac, st.scene_dir, ".prefab", "Prefab ekle");
-        }
-        ImGui::Separator();
-        // Panel ac/kapa. Yalniz GERCEKTEN cizilen paneller listelenir --
-        // arkasi bos bir "Sequencer" / "Arazi Firca" / "Girdi Yoneticisi"
-        // satiri kullaniciya var olmayan bir yetenek soyler.
-        if (ImGui::MenuItem("Konsol", nullptr, &show_console)) {}
-        if (ImGui::MenuItem("Materyal D\xC3\xBC\xC4\x9F\xC3\xBCm (Node) Edit\xC3\xB6r\xC3\xBC (\xC3\xB6nizleme)", nullptr, &st.show_node_editor)) {}
-        ImGui::Separator();
-        if (ImGui::MenuItem("Yap\xC4\xB1\xC5\x9Ft\xC4\xB1r", "Ctrl+V", false, st.clip_count > 0)) do_paste();
-        if (ImGui::MenuItem("T\xC3\xBCm\xC3\xBCn\xC3\xBC Se\xC3\xA7", "Ctrl+A", false, st.scene.entity_count > 0)) {
-          st.sel.clear();
-          for (uint32_t k = st.scene.entity_count; k > 0; k--) st.sel.toggle((int32_t)(k - 1));
-        }
-        ImGui::EndPopup();
-      }
       // Cizim sirasi belirlenimli ON-SIRADIR (kokler indeks sirasinda, cocuklar
       // indeks sirasinda). SUZGEC ACIKKEN duz liste cizilir: katlanmis bir ata
       // eslesmeyi gizlemesin.
@@ -2774,6 +2744,9 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
           if (ImGui::MenuItem("T\xC3\xBCm Katlamalar\xC4\xB1 Kapat")) {
             for (uint32_t i = 0; i < st.scene.entity_count; i++) st.tree.collapse.set(i, true);
           }
+          ImGui::Separator();
+          if (ImGui::MenuItem(ICON_MD_ACCOUNT_TREE "  Materyal D\xC3\xBC\xC4\x9F\xC3\xBCm (Node) Edit\xC3\xB6r\xC3\xBC", nullptr, &st.show_node_editor)) {}
+          if (ImGui::MenuItem(ICON_MD_TERMINAL "  Konsol", nullptr, &show_console)) {}
           ImGui::EndMenu();
         }
 
