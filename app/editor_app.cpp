@@ -3076,20 +3076,24 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
 
                 ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 H\xC3\xBCzme \xC3\x96nayarlar\xC4\xB1:");
                 ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
-                if (ImGui::SmallButton("Do\xC4\x9F" "al G\xC3\xBCne\xC5\x9F")) {
-                  st.scene.godray_density = 0.8f; st.scene.godray_weight = 0.5f; st.scene.godray_decay = 0.95f; st.scene.godray_exposure = 0.3f; st.dirty = true;
+                if (ImGui::SmallButton("Hafif / Duman")) {
+                  after = e; after.light_godray_intensity = 0.12f; commit(st, si, after);
+                  st.scene.godray_density = 0.35f; st.scene.godray_weight = 0.25f; st.scene.godray_decay = 0.90f; st.scene.godray_exposure = 0.15f; st.dirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Do\xC4\x9F" "al")) {
+                  after = e; after.light_godray_intensity = 0.5f; commit(st, si, after);
+                  st.scene.godray_density = 0.7f; st.scene.godray_weight = 0.45f; st.scene.godray_decay = 0.94f; st.scene.godray_exposure = 0.25f; st.dirty = true;
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Dramatik")) {
-                  st.scene.godray_density = 1.2f; st.scene.godray_weight = 0.7f; st.scene.godray_decay = 0.97f; st.scene.godray_exposure = 0.5f; st.dirty = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Hafif Sis")) {
-                  st.scene.godray_density = 0.5f; st.scene.godray_weight = 0.3f; st.scene.godray_decay = 0.92f; st.scene.godray_exposure = 0.2f; st.dirty = true;
+                  after = e; after.light_godray_intensity = 1.2f; commit(st, si, after);
+                  st.scene.godray_density = 1.1f; st.scene.godray_weight = 0.65f; st.scene.godray_decay = 0.97f; st.scene.godray_exposure = 0.40f; st.dirty = true;
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Sinematik")) {
-                  st.scene.godray_density = 1.4f; st.scene.godray_weight = 0.8f; st.scene.godray_decay = 0.98f; st.scene.godray_exposure = 0.6f; st.dirty = true;
+                  after = e; after.light_godray_intensity = 2.0f; commit(st, si, after);
+                  st.scene.godray_density = 1.4f; st.scene.godray_weight = 0.8f; st.scene.godray_decay = 0.98f; st.scene.godray_exposure = 0.55f; st.dirty = true;
                 }
                 ImGui::PopStyleVar();
               }
@@ -4530,32 +4534,31 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         cone_m.m[3][2] = center.z;
         cone_m.m[3][3] = 1.0f;
 
-        Vec3 beam_col = e.light_color * (e.light_godray_intensity * 0.85f);
-        ren.draw(st.prims[content::kPrimCone], st.beam_mat, cone_m, beam_col);
+        // Hacimsel huzmenin parlakligini kullanicinin sectigi huzme gucu (intensity),
+        // yogunluk (density) ve pozlama (exposure) ile birebir dinamik olcekleyelim:
+        float beam_lum = (e.light_godray_intensity * 0.35f) * (st.scene.godray_density * 0.5f) * (st.scene.godray_exposure * 1.6f);
+        if (beam_lum < 0.001f) beam_lum = 0.001f;
+        renderer::PbrParams bp;
+        bp.metallic = 0.0f;
+        bp.roughness = 1.0f;
+        bp.emissive = e.light_color * beam_lum;
+        ren.set_material_pbr(st.beam_mat, bp);
+
+        ren.draw(st.prims[content::kPrimCone], st.beam_mat, cone_m, e.light_color);
       }
     }
-    // --- RDR2 tarzi sinematik isik huzmesi (God Rays) cekirdek cizimi --------
-    // Sahnedeki engellerin (duvar, kutu) gunesi fiziksel olarak perdelemesi ve
-    // arkasindan gercek isik saftlari akmasi icin sahne derinlik testine tabi
-    // parlak bir gunes/isik cekirdegi cizilir.
-    if (st.scene.godrays_enabled && gr_intensity > 0.0f && st.prims[content::kPrimSphere].valid()) {
-      if (gr_source.w == 0.0f) {
-        // Yonlu gunes isigi (directional sun)
-        Vec3 sun_d = normalize(Vec3{gr_source.x, gr_source.y, gr_source.z});
-        Vec3 to_sun = {-sun_d.x, -sun_d.y, -sun_d.z};
-        Vec3 eye = camera_eye(cam);
-        float sun_dist = 150.0f; // zfar (200.0f) onunde, sahne nesnelerinin arkasinda
-        Vec3 sun_pos = eye + to_sun * sun_dist;
-        float sun_radius = sun_dist * 0.09f; // dogal gokyuzu gunes diski
-        Mat4 sun_m = Mat4::translate(sun_pos) * Mat4::scale(Vec3{sun_radius, sun_radius, sun_radius});
-        ren.draw(st.prims[content::kPrimSphere], st.sun_mat, sun_m, Vec3{1.0f, 0.96f, 0.88f});
-      } else {
-        // Nokta ya da spot isik (point / spot light)
-        Vec3 light_pos = {gr_source.x, gr_source.y, gr_source.z};
-        float core_radius = 0.35f;
-        Mat4 core_m = Mat4::translate(light_pos) * Mat4::scale(Vec3{core_radius, core_radius, core_radius});
-        ren.draw(st.prims[content::kPrimSphere], st.light_core_mat, core_m, Vec3{1.0f, 1.0f, 1.0f});
-      }
+    // --- Gunes diski (yalnizca gokyuzundeki directional sun icin) ---
+    // Spot ve kapali alan isiklarinda 3B koni zaten ciziliyor; lamba tepesine
+    // kor edici yapay kure basmayarak huzmenin dogal ve seffaf gorunmesini saglar.
+    if (st.scene.godrays_enabled && gr_intensity > 0.0f && gr_source.w == 0.0f && st.prims[content::kPrimSphere].valid()) {
+      Vec3 sun_d = normalize(Vec3{gr_source.x, gr_source.y, gr_source.z});
+      Vec3 to_sun = {-sun_d.x, -sun_d.y, -sun_d.z};
+      Vec3 eye = camera_eye(cam);
+      float sun_dist = 150.0f; // zfar (200.0f) onunde, sahne nesnelerinin arkasinda
+      Vec3 sun_pos = eye + to_sun * sun_dist;
+      float sun_radius = sun_dist * 0.09f; // dogal gokyuzu gunes diski
+      Mat4 sun_m = Mat4::translate(sun_pos) * Mat4::scale(Vec3{sun_radius, sun_radius, sun_radius});
+      ren.draw(st.prims[content::kPrimSphere], st.sun_mat, sun_m, Vec3{1.0f, 0.96f, 0.88f});
     }
     // Isik yaricapi / golge hacmi / gunes yonu: motorun kendi draw'u ile ince kutular.
     // --- Gorunum kipi kaplamalari -------------------------------------------
