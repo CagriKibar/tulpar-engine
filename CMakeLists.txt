@@ -18,6 +18,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 enable_language(ASM)
 find_package(Threads REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 option(ENGINE_MEM_CANARY "Arena blok kanaryalari (tasma tespiti; ship'te kapat)" ON)
 option(ENGINE_TRACY "Tracy profiler istemcisi (third_party/tracy, BSD-3): profiler bolgeleri + kare isaretleri Tracy'ye de basilir" OFF)
@@ -47,7 +48,7 @@ target_link_libraries(engine_platform PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 # --- Katman denetimi --------------------------------------------------------
 add_custom_target(engine_layer_check
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/layer_check.py ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND "${Python3_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/tools/layer_check.py ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "engine: katman bagimlilik denetimi (ihlal = build hatasi)"
     VERBATIM
 )
@@ -57,7 +58,7 @@ add_custom_target(engine_layer_check
 # Yoksa ImGui sessizce bos kutu cizer ve arayuz hata vermeden bozulur
 # (olculdu: 16 kod noktasi / 34 cagri, panel baslikleri dahil).
 add_custom_target(engine_icon_check
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/icon_check.py ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND "${Python3_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/tools/icon_check.py ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "engine: editor ikon glif denetimi (eksik glif = build hatasi)"
     VERBATIM
 )
@@ -68,7 +69,7 @@ add_custom_target(engine_icon_check
 # ya da ALANLAR KAYAR (olculdu: arazi/su/ruzgar/voksel dortu de birer fazla
 # jeton bekliyordu, pbr dali kMaxTok yuzunden hic ulasilamiyordu).
 add_custom_target(engine_scene_check
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/scene_check.py ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND "${Python3_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/tools/scene_check.py ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "engine: .sahne yazici/ayristirici uyum denetimi"
     VERBATIM
 )
@@ -83,7 +84,7 @@ add_custom_target(engine_scene_check
 # GEREKTIRMEZ (baslik kaynaginin SHA-256'sini tasir); glslc varsa ustune bayt
 # karsilastirmasi da kosar, yoksa bunu GORUNUR sekilde yazar.
 add_custom_target(engine_shader_check
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_check.py ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND "${Python3_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_check.py ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "engine: uretilmis SPIR-V <-> GLSL tazelik denetimi (bayat = build hatasi)"
     VERBATIM
 )

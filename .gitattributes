@@ -37,6 +37,9 @@
 # ozet/bayt sayisiyla karsilastiriliyor.
 *.tprs       text eol=lf
 *.gltf       text eol=lf
+*.vert       text eol=lf
+*.frag       text eol=lf
+*.comp       text eol=lf
 
 # Ikili varliklar: git'in sezgisine birakilmasin.
 *.png   binary
