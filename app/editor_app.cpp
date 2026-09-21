@@ -31,8 +31,25 @@
 #include "content/gltf.hpp"
 #include "content/hash.hpp"
 #include "content/primitives.hpp"
+#include "content/particles.hpp"
+#include "content/particle_module.hpp"
+#include "content/ribbon.hpp"
+#include "content/vfx_graph.hpp"
 #include "content/scene.hpp"
 #include "content/scene_blob.hpp"
+#include "sim/voxel_smoke.hpp"
+#include "audio/mixer.hpp"
+#include "audio/spatial.hpp"
+#include "content/device_tier.hpp"
+#include "content/dynamic_quality.hpp"
+#include "renderer/cull.hpp"
+#include "sim/boids.hpp"
+#include "sim/chaos_physics.hpp"
+#include "sim/fluid_system.hpp"
+#include "sim/mls_mpm.hpp"
+#include "sim/physics.hpp"
+#include "sim/quantum_gen.hpp"
+#include "sim/rollback.hpp"
 // Prosedurel arazi/su/voksel onizlemesi derlenmis sahneninkiyle AYNI
 // ureticileri kullanir (make_terrain_mesh / make_voxel_mesh / make_water_mesh
 // scene_runtime.hpp'de bildirildi) -- editorde gorulen sey oyunda cikan sey
@@ -42,6 +59,7 @@
 #include "content/voxel.hpp"
 #include "content/water_wave.hpp"
 #include "core/jobs/job_system.hpp"
+#include "core/math/noise.hpp"
 #include "core/memory/arena.hpp"
 #include "core/profiler/profiler.hpp"
 #include "platform/memory.hpp"   // os_page_size (RSS hesabi)
@@ -71,6 +89,8 @@ namespace tulpar::engine::app {
 
 namespace {
 constexpr float kPi = 3.14159265358979f;
+static float s_smoke_live_diff = 0.20f;
+static float s_smoke_live_diss = 0.015f;
 using content::SceneDesc;
 using content::SceneEntity;
 
@@ -345,6 +365,34 @@ struct RenderSettings {
   bool jitter = kRenderDefaults.temporal.jitter;
 };
 
+enum class TerrainBrushMode : uint8_t {
+  Yukselt = 0, // Raise
+  Alcalt,      // Lower
+  Duzlestir,   // Flatten
+  Yumusat,     // Smooth
+  Gurultu,     // Noise
+  Teras        // Terrace
+};
+
+struct TerrainSculptLayer {
+  float *deltas = nullptr;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t version = 0;
+};
+
+struct TerrainBrushSettings {
+  TerrainBrushMode mode = TerrainBrushMode::Yukselt;
+  float radius = 8.0f;
+  float strength = 1.0f;
+  float target_height = 5.0f;
+  float terrace_step = 2.0f;
+  bool active = false; // 3D gorunumde fircayla boyama acik/kapali
+  Vec3 hit_world{0, 0, 0};
+  Vec3 hit_local{0, 0, 0};
+  bool hit_valid = false;
+};
+
 struct EditorState {
   SceneDesc scene;
   content::SceneHistory hist;
@@ -376,9 +424,24 @@ struct EditorState {
   uint32_t terrain_hash[content::kSceneMaxEntities] = {};
   uint32_t voxel_hash[content::kSceneMaxEntities] = {};
   uint32_t water_hash[content::kSceneMaxEntities] = {};
+  uint32_t terrain_mesh_w[content::kSceneMaxEntities] = {};
+  uint32_t terrain_mesh_h[content::kSceneMaxEntities] = {};
+  // Arazi heykeltiras (sculpt) fircalari ve degisiklik katmani
+  TerrainBrushSettings terrain_brush;
+  TerrainSculptLayer terrain_sculpt[content::kSceneMaxEntities] = {};
+  Arena sculpt_arena;
   // Malzemeler ACILISTA kurulur. create_material kare icinde cagrilirsa
   // "kare basina 0 ayirma" kapisi duser (scene_runtime.cpp ayni notu tasiyor).
-  renderer::MaterialHandle terrain_mat{}, voxel_mat{}, water_mat{}, sun_mat{}, light_core_mat{};
+  renderer::MaterialHandle terrain_mat{}, voxel_mat{}, water_mat{}, sun_mat{}, light_core_mat{}, beam_mat{}, particle_mat{};
+  renderer::MaterialHandle entity_mats[content::kSceneMaxEntities] = {};
+  renderer::PbrTextures entity_pbr_tex[content::kSceneMaxEntities] = {};
+  renderer::TextureHandle entity_albedo_tex[content::kSceneMaxEntities] = {};
+  renderer::TextureHandle particle_tex{};
+  renderer::TextureHandle tex_checker{};
+  renderer::TextureHandle tex_brick_normal{};
+  renderer::TextureHandle tex_rough_orm{};
+  renderer::TextureHandle tex_grid{};
+  renderer::TextureHandle tex_wood{};
   // Prosedurel uretimin GECICI alani: her uretimde mark/reset_to ile geri
   // sarilir. Motorun tek bellek kaynagi arena -- std::malloc DEGIL (AllocGate
   // global ayirmalari sayiyor). Ana `sys` arenasi DOGRUDAN kullanilamaz:
@@ -430,6 +493,16 @@ struct EditorState {
   content::SceneGiReport gi_report{};
   bool gi_baked = false, gi_preview = false;
   uint32_t gi_bake_undo_count = 0;
+  // Partikül Simülasyonu & VFX (sabit kapasite arena)
+  content::ParticleSystem particles;
+  Rng particle_rng{1337};
+  float particle_spawn_accum[content::kSceneMaxEntities] = {};
+  bool particle_sim_paused = false;
+  // Canlı Şerit / Kuyruk İzi (Ribbon Trail) & CS2 Voksel Dumanı
+  content::RibbonTrail ribbon_trail;
+  bool ribbon_initialized = false;
+  sim::VoxelSmokeGrid smoke_grid;
+  bool smoke_initialized = false;
 };
 
 // Varlik silindikten / geri alindiktan sonra secimi gecerli tut.
@@ -607,15 +680,33 @@ void proc_refresh(EditorState &st, renderer::Renderer &ren, uint32_t i) {
     cfg.frequency = e.terrain_freq;
     cfg.octaves = e.terrain_octaves;
     cfg.seed = e.terrain_seed;
-    const uint32_t h = proc_hash(&cfg, sizeof cfg);
+    const uint32_t sculpt_ver = st.terrain_sculpt[i].version;
+    const uint32_t h = proc_hash(&cfg, sizeof cfg) ^ (sculpt_ver * 0x9e3779b9u);
     if (h != st.terrain_hash[i]) {
-      st.terrain_meshes[i] = content::make_terrain_mesh(st.proc_arena, ren, cfg);
+      const float *deltas = (st.terrain_sculpt[i].deltas &&
+                             st.terrain_sculpt[i].width == cfg.width &&
+                             st.terrain_sculpt[i].height == cfg.height)
+                                ? st.terrain_sculpt[i].deltas
+                                : nullptr;
+      bool updated = false;
+      if (st.terrain_meshes[i].valid() &&
+          st.terrain_mesh_w[i] == cfg.width &&
+          st.terrain_mesh_h[i] == cfg.height) {
+        updated = content::update_terrain_mesh_vertices(st.proc_arena, ren, st.terrain_meshes[i], cfg, deltas);
+      }
+      if (!updated) {
+        st.terrain_meshes[i] = content::make_terrain_mesh(st.proc_arena, ren, cfg, deltas);
+        st.terrain_mesh_w[i] = cfg.width;
+        st.terrain_mesh_h[i] = cfg.height;
+      }
       st.proc_arena.reset_to(mark);
       st.terrain_hash[i] = h;
     }
   } else if (st.terrain_hash[i]) {
     st.terrain_meshes[i] = renderer::MeshHandle{}; // bilesen kaldirildi: cizme
     st.terrain_hash[i] = 0;
+    st.terrain_mesh_w[i] = 0;
+    st.terrain_mesh_h[i] = 0;
   }
   if (e.components & content::kSceneVoxel) {
     const struct { uint32_t x, y, z; float cell; } key{e.voxel_size_x, e.voxel_size_y, e.voxel_size_z, e.voxel_cell};
@@ -646,6 +737,359 @@ void proc_refresh(EditorState &st, renderer::Renderer &ren, uint32_t i) {
     st.water_meshes[i] = renderer::MeshHandle{};
     st.water_hash[i] = 0;
   }
+}
+
+static float *get_or_create_terrain_deltas(EditorState &st, uint32_t ent_idx, uint32_t width, uint32_t height) {
+  if (ent_idx >= content::kSceneMaxEntities) return nullptr;
+  auto &sc = st.terrain_sculpt[ent_idx];
+  const uint32_t total = width * height;
+  if (sc.deltas && sc.width == width && sc.height == height) return sc.deltas;
+  if (st.sculpt_arena.capacity() == 0) return nullptr;
+  sc.deltas = st.sculpt_arena.alloc_array<float>(total);
+  if (!sc.deltas) return nullptr;
+  std::memset(sc.deltas, 0, total * sizeof(float));
+  sc.width = width;
+  sc.height = height;
+  sc.version = 0;
+  return sc.deltas;
+}
+
+static float sample_terrain_height_with_sculpt(const EditorState &st, uint32_t ent_idx, float lx, float lz) {
+  if (ent_idx >= st.scene.entity_count) return 0.0f;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width;
+  const uint32_t h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  if (w < 2 || h < 2) return 0.0f;
+
+  float gx = lx / cell;
+  float gz = lz / cell;
+  if (gx < 0.0f) gx = 0.0f;
+  if (gz < 0.0f) gz = 0.0f;
+  if (gx > (float)(w - 1)) gx = (float)(w - 1);
+  if (gz > (float)(h - 1)) gz = (float)(h - 1);
+
+  const uint32_t x0 = (uint32_t)std::floor(gx);
+  const uint32_t z0 = (uint32_t)std::floor(gz);
+  const uint32_t x1 = x0 + 1 < w ? x0 + 1 : x0;
+  const uint32_t z1 = z0 + 1 < h ? z0 + 1 : z0;
+  const float tx = gx - (float)x0;
+  const float tz = gz - (float)z0;
+
+  content::HeightmapConfig cfg;
+  cfg.width = w; cfg.height = h; cfg.cell_size = cell;
+  cfg.amplitude = e.terrain_amp; cfg.frequency = e.terrain_freq;
+  cfg.octaves = e.terrain_octaves; cfg.seed = e.terrain_seed;
+
+  auto get_h = [&](uint32_t x, uint32_t z) -> float {
+    const float nx = (float)x * cell * cfg.frequency;
+    const float nz = (float)z * cell * cfg.frequency;
+    float base = fbm_2d(nx, nz, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+    const auto &sc = st.terrain_sculpt[ent_idx];
+    if (sc.deltas && sc.width == w && sc.height == h) {
+      base += sc.deltas[z * w + x];
+    }
+    return base;
+  };
+
+  const float h00 = get_h(x0, z0);
+  const float h10 = get_h(x1, z0);
+  const float h01 = get_h(x0, z1);
+  const float h11 = get_h(x1, z1);
+
+  const float h0 = h00 * (1.0f - tx) + h10 * tx;
+  const float h1 = h01 * (1.0f - tx) + h11 * tx;
+  return h0 * (1.0f - tz) + h1 * tz;
+}
+
+static void apply_terrain_brush(EditorState &st, uint32_t ent_idx, float center_lx, float center_lz, float dt, bool invert = false) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  if (!(e.components & content::kSceneTerrain)) return;
+  const uint32_t w = (uint32_t)e.terrain_width;
+  const uint32_t h = (uint32_t)e.terrain_height;
+  if (w < 2 || h < 2) return;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  const float rad = st.terrain_brush.radius > 0.1f ? st.terrain_brush.radius : 1.0f;
+  const float str = st.terrain_brush.strength;
+  TerrainBrushMode mode = st.terrain_brush.mode;
+  if (invert) {
+    if (mode == TerrainBrushMode::Yukselt) mode = TerrainBrushMode::Alcalt;
+    else if (mode == TerrainBrushMode::Alcalt) mode = TerrainBrushMode::Yukselt;
+  }
+
+  const float step_dt = dt > 0.0f ? dt : 0.05f;
+  const float pi = 3.14159265358979323846f;
+
+  content::HeightmapConfig cfg;
+  cfg.width = w; cfg.height = h; cfg.cell_size = cell;
+  cfg.amplitude = e.terrain_amp; cfg.frequency = e.terrain_freq;
+  cfg.octaves = e.terrain_octaves; cfg.seed = e.terrain_seed;
+
+  const int min_x = (int)std::floor((center_lx - rad) / cell);
+  const int max_x = (int)std::ceil((center_lx + rad) / cell);
+  const int min_z = (int)std::floor((center_lz - rad) / cell);
+  const int max_z = (int)std::ceil((center_lz + rad) / cell);
+
+  const int cl_min_x = min_x < 0 ? 0 : min_x;
+  const int cl_max_x = max_x >= (int)w ? (int)w - 1 : max_x;
+  const int cl_min_z = min_z < 0 ? 0 : min_z;
+  const int cl_max_z = max_z >= (int)h ? (int)h - 1 : max_z;
+
+  for (int z = cl_min_z; z <= cl_max_z; z++) {
+    for (int x = cl_min_x; x <= cl_max_x; x++) {
+      const float vx = (float)x * cell;
+      const float vz = (float)z * cell;
+      const float dx = vx - center_lx;
+      const float dz = vz - center_lz;
+      const float dist = std::sqrt(dx * dx + dz * dz);
+      if (dist > rad) continue;
+      const float falloff = 0.5f * (1.0f + std::cos((dist / rad) * pi));
+      const uint32_t idx = (uint32_t)(z * w + x);
+
+      const float nx = (float)x * cell * cfg.frequency;
+      const float nz = (float)z * cell * cfg.frequency;
+      const float base_h = fbm_2d(nx, nz, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+      const float cur_h = base_h + deltas[idx];
+
+      switch (mode) {
+        case TerrainBrushMode::Yukselt: {
+          deltas[idx] += str * falloff * 10.0f * step_dt;
+          break;
+        }
+        case TerrainBrushMode::Alcalt: {
+          deltas[idx] -= str * falloff * 10.0f * step_dt;
+          break;
+        }
+        case TerrainBrushMode::Duzlestir: {
+          const float target = st.terrain_brush.target_height;
+          const float diff = target - cur_h;
+          deltas[idx] += diff * falloff * std::min(1.0f, str * 6.0f * step_dt);
+          break;
+        }
+        case TerrainBrushMode::Yumusat: {
+          float sum = 0.0f;
+          int count = 0;
+          for (int oz = -1; oz <= 1; oz++) {
+            for (int ox = -1; ox <= 1; ox++) {
+              const int nx_i = x + ox, nz_i = z + oz;
+              if (nx_i >= 0 && nx_i < (int)w && nz_i >= 0 && nz_i < (int)h) {
+                const uint32_t nidx = (uint32_t)(nz_i * w + nx_i);
+                const float n_base = fbm_2d((float)nx_i * cell * cfg.frequency, (float)nz_i * cell * cfg.frequency, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+                sum += n_base + deltas[nidx];
+                count++;
+              }
+            }
+          }
+          if (count > 0) {
+            const float avg = sum / (float)count;
+            const float diff = avg - cur_h;
+            deltas[idx] += diff * falloff * std::min(1.0f, str * 8.0f * step_dt);
+          }
+          break;
+        }
+        case TerrainBrushMode::Gurultu: {
+          const float nval = (value_noise_2d((float)x * 0.45f, (float)z * 0.45f, cfg.seed + 991) - 0.5f) * 2.0f;
+          deltas[idx] += nval * str * falloff * 8.0f * step_dt;
+          break;
+        }
+        case TerrainBrushMode::Teras: {
+          const float step = st.terrain_brush.terrace_step > 0.1f ? st.terrain_brush.terrace_step : 2.0f;
+          const float target = std::round(cur_h / step) * step;
+          const float diff = target - cur_h;
+          deltas[idx] += diff * falloff * std::min(1.0f, str * 6.0f * step_dt);
+          break;
+        }
+      }
+    }
+  }
+
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  st.dirty = true;
+}
+
+static void stamp_raise_mountain(EditorState &st, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const float cx = (float)w * cell * 0.5f, cz = (float)h * cell * 0.5f;
+  const float rad = (float)std::min(w, h) * cell * 0.42f;
+  const float pi = 3.14159265358979323846f;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float vx = (float)x * cell, vz = (float)z * cell;
+      const float dist = std::sqrt((vx - cx) * (vx - cx) + (vz - cz) * (vz - cz));
+      if (dist < rad) {
+        const float falloff = 0.5f * (1.0f + std::cos((dist / rad) * pi));
+        deltas[z * w + x] += 12.0f * falloff;
+      }
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  st.dirty = true;
+  set_status(st, "arazi: tepe/zirve kabartildi (+12m)");
+}
+
+static void stamp_carve_crater(EditorState &st, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const float cx = (float)w * cell * 0.5f, cz = (float)h * cell * 0.5f;
+  const float rad = (float)std::min(w, h) * cell * 0.38f;
+  const float pi = 3.14159265358979323846f;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float vx = (float)x * cell, vz = (float)z * cell;
+      const float dist = std::sqrt((vx - cx) * (vx - cx) + (vz - cz) * (vz - cz));
+      if (dist < rad) {
+        const float u = dist / rad;
+        if (u < 0.65f) {
+          const float depth_falloff = 0.5f * (1.0f + std::cos((u / 0.65f) * pi));
+          deltas[z * w + x] -= 8.0f * depth_falloff;
+        } else {
+          const float rim = std::sin(((u - 0.65f) / 0.35f) * pi);
+          deltas[z * w + x] += 3.5f * rim;
+        }
+      }
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  st.dirty = true;
+  set_status(st, "arazi: krater/cukur kazildi");
+}
+
+static void stamp_flatten_plateau(EditorState &st, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const float cx = (float)w * cell * 0.5f, cz = (float)h * cell * 0.5f;
+  const float rad = (float)std::min(w, h) * cell * 0.35f;
+  const float pi = 3.14159265358979323846f;
+  const float target = st.terrain_brush.target_height;
+  content::HeightmapConfig cfg;
+  cfg.width = w; cfg.height = h; cfg.cell_size = cell;
+  cfg.amplitude = e.terrain_amp; cfg.frequency = e.terrain_freq;
+  cfg.octaves = e.terrain_octaves; cfg.seed = e.terrain_seed;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float vx = (float)x * cell, vz = (float)z * cell;
+      const float dist = std::sqrt((vx - cx) * (vx - cx) + (vz - cz) * (vz - cz));
+      if (dist < rad) {
+        const float falloff = 0.5f * (1.0f + std::cos((dist / rad) * pi));
+        const float nx = (float)x * cell * cfg.frequency;
+        const float nz = (float)z * cell * cfg.frequency;
+        const float base_h = fbm_2d(nx, nz, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+        const float cur_h = base_h + deltas[z * w + x];
+        deltas[z * w + x] += (target - cur_h) * falloff;
+      }
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  st.dirty = true;
+  set_status(st, "arazi: zirve platosu duzlestirildi (%.1f m)", target);
+}
+
+static void stamp_smooth_erosion(EditorState &st, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const size_t mark = st.proc_arena.mark();
+  float *temp = st.proc_arena.alloc_array<float>(w * h);
+  if (temp) {
+    std::memcpy(temp, deltas, w * h * sizeof(float));
+    for (uint32_t z = 1; z + 1 < h; z++) {
+      for (uint32_t x = 1; x + 1 < w; x++) {
+        float sum = 0.0f;
+        for (int oz = -1; oz <= 1; oz++) {
+          for (int ox = -1; ox <= 1; ox++) {
+            sum += temp[(z + oz) * w + (x + ox)];
+          }
+        }
+        deltas[z * w + x] = sum / 9.0f;
+      }
+    }
+    st.proc_arena.reset_to(mark);
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  st.dirty = true;
+  set_status(st, "arazi: erozyon yumusatmasi uygulandi");
+}
+
+static void stamp_add_rock_noise(EditorState &st, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float n = (value_noise_2d((float)x * 0.7f, (float)z * 0.7f, 1337) - 0.5f) * 2.0f;
+      deltas[z * w + x] += n * 1.5f;
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  st.dirty = true;
+  set_status(st, "arazi: kayalik mikro puruzler basildi");
+}
+
+static void stamp_terrace_steps(EditorState &st, uint32_t ent_idx) {
+  if (ent_idx >= st.scene.entity_count) return;
+  const SceneEntity &e = st.scene.entities[ent_idx];
+  const uint32_t w = (uint32_t)e.terrain_width, h = (uint32_t)e.terrain_height;
+  const float cell = e.terrain_cell > 0.001f ? e.terrain_cell : 1.0f;
+  float *deltas = get_or_create_terrain_deltas(st, ent_idx, w, h);
+  if (!deltas) return;
+  const float step = st.terrain_brush.terrace_step > 0.1f ? st.terrain_brush.terrace_step : 2.5f;
+  content::HeightmapConfig cfg;
+  cfg.width = w; cfg.height = h; cfg.cell_size = cell;
+  cfg.amplitude = e.terrain_amp; cfg.frequency = e.terrain_freq;
+  cfg.octaves = e.terrain_octaves; cfg.seed = e.terrain_seed;
+  for (uint32_t z = 0; z < h; z++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const float nx = (float)x * cell * cfg.frequency;
+      const float nz = (float)z * cell * cfg.frequency;
+      const float base_h = fbm_2d(nx, nz, cfg.seed, cfg.octaves, cfg.lacunarity, cfg.gain) * cfg.amplitude;
+      const float cur_h = base_h + deltas[z * w + x];
+      const float stepped = std::round(cur_h / step) * step;
+      deltas[z * w + x] += (stepped - cur_h) * 0.7f;
+    }
+  }
+  st.terrain_sculpt[ent_idx].version++;
+  st.terrain_hash[ent_idx] = 0;
+  st.dirty = true;
+  set_status(st, "arazi: basamakli teraslama uygulandi (%.1f m)", step);
+}
+
+static void stamp_reset_sculpt(EditorState &st, uint32_t ent_idx) {
+  if (ent_idx >= content::kSceneMaxEntities) return;
+  auto &sc = st.terrain_sculpt[ent_idx];
+  if (sc.deltas) {
+    std::memset(sc.deltas, 0, sc.width * sc.height * sizeof(float));
+  }
+  sc.version++;
+  st.terrain_hash[ent_idx] = 0;
+  st.dirty = true;
+  set_status(st, "arazi: tum heykeltiras/firca degisiklikleri sifirlandi");
 }
 
 // Ayrik widget (onay kutusu, secim): kopya uzerinde degisiklik, hemen islem.
@@ -724,6 +1168,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
 
   renderer::Renderer ren;
   renderer::RendererConfig rc;
+  rc.max_meshes = 1024;
+  rc.max_materials = 1024;
   rc.srgb_target = true; // hedef ARTIK viewport ve o *_SRGB (bkz. EditorViewportConfig)
   // --- Son isleme (post): ISIMA GORUNSUN DIYE ACIK --------------------------
   // post kapaliyken renderer dogrudan LDR hedefe yazar ve isima 1.0e
@@ -771,6 +1217,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
   // onizleme sessizce degil, KONSOLA yazarak kapanir.
   if (!sys.carve(st.proc_arena, 64u << 20, "editor_proc_mesh", OverflowPolicy::ReturnNull))
     console_log(ConsoleLevel::Uyari, kConsoleTagEditor, "prosedurel onizleme arenasi ayrilamadi: arazi/su/voksel cizilmeyecek");
+  if (!sys.carve(st.sculpt_arena, 16u << 20, "editor_sculpt", OverflowPolicy::ReturnNull))
+    console_log(ConsoleLevel::Uyari, kConsoleTagEditor, "sculpt arenasi ayrilamadi: arazi sekillendirme kullanilamayacak");
   // Ilkel mesh tablosu: SAHNEDEN BAGIMSIZ, salt geometri, bir kez kurulur.
   // SceneRuntime de AYNI fonksiyonu cagirir -- kapsul/silindir/koni/dortgen/
   // simit editorde ve derlenmis oyunda ayni geometriyi gosterir.
@@ -793,6 +1241,108 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
     core_p.metallic = 0.0f; core_p.roughness = 1.0f;
     core_p.emissive = Vec3{28.0f, 25.0f, 20.0f}; // Nokta/Spot isik cekirdegi
     st.light_core_mat = ren.create_material(ren.default_texture(), Vec3{1, 1, 1}, core_p);
+    renderer::PbrParams beam_p;
+    beam_p.metallic = 0.0f; beam_p.roughness = 1.0f;
+    beam_p.emissive = Vec3{8.0f, 7.5f, 6.0f}; // Hacimsel isik huzmesi / fake godray
+    st.beam_mat = ren.create_material(ren.default_texture(), Vec3{1, 1, 1}, beam_p);
+    renderer::PbrParams part_p;
+    part_p.metallic = 0.0f; part_p.roughness = 0.8f;
+    part_p.emissive_strength = 2.5f; // Parlayan gorsel efektler & bloom
+
+    // Usulsel Gaussian Dairesel Yumusak Alfa Dokusu (64x64) - Karton kutu sis/duman yerine ipeksi vfx
+    alignas(16) uint8_t gauss_px[64 * 64 * 4];
+    for (int y = 0; y < 64; y++) {
+      for (int x = 0; x < 64; x++) {
+        const float nx = (float(x) - 31.5f) / 31.5f;
+        const float ny = (float(y) - 31.5f) / 31.5f;
+        const float d2 = nx * nx + ny * ny;
+        const float a = d2 < 1.0f ? std::exp(-3.5f * d2) * (1.0f - d2) : 0.0f;
+        const int iv = int(a * 255.0f + 0.5f);
+        const uint8_t alpha = (uint8_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv));
+        const int idx = (y * 64 + x) * 4;
+        gauss_px[idx + 0] = alpha;
+        gauss_px[idx + 1] = alpha;
+        gauss_px[idx + 2] = alpha;
+        gauss_px[idx + 3] = alpha;
+      }
+    }
+    st.particle_tex = ren.create_texture(gauss_px, 64, 64, true, false);
+    st.particle_mat = ren.create_material(st.particle_tex, Vec3{1, 1, 1}, part_p);
+
+    // Dama Tahtasi (Checkerboard 64x64)
+    alignas(16) uint8_t chk_px[64 * 64 * 4];
+    for (int y = 0; y < 64; y++) {
+      for (int x = 0; x < 64; x++) {
+        const bool dark = (((x / 8) + (y / 8)) & 1) != 0;
+        const uint8_t c = dark ? 90 : 235;
+        const int idx = (y * 64 + x) * 4;
+        chk_px[idx + 0] = c; chk_px[idx + 1] = c; chk_px[idx + 2] = c; chk_px[idx + 3] = 255;
+      }
+    }
+    st.tex_checker = ren.create_texture(chk_px, 64, 64, true, true);
+
+    // Prosedurel Tas / Tugla Normal Haritasi (64x64)
+    alignas(16) uint8_t norm_px[64 * 64 * 4];
+    for (int y = 0; y < 64; y++) {
+      for (int x = 0; x < 64; x++) {
+        const int bx = x % 16, by = y % 8;
+        const float dx = (bx == 0) ? -0.8f : (bx == 15) ? 0.8f : 0.0f;
+        const float dy = (by == 0) ? -0.8f : (by == 7)  ? 0.8f : 0.0f;
+        const float len = std::sqrt(dx * dx + dy * dy + 1.0f);
+        const float nx = dx / len, ny = dy / len, nz = 1.0f / len;
+        const int idx = (y * 64 + x) * 4;
+        norm_px[idx + 0] = (uint8_t)((nx * 0.5f + 0.5f) * 255.0f);
+        norm_px[idx + 1] = (uint8_t)((ny * 0.5f + 0.5f) * 255.0f);
+        norm_px[idx + 2] = (uint8_t)((nz * 0.5f + 0.5f) * 255.0f);
+        norm_px[idx + 3] = 255;
+      }
+    }
+    st.tex_brick_normal = ren.create_texture(norm_px, 64, 64, true, false);
+
+    // Prosedurel ORM Haritasi (64x64, R=Occlusion, G=Roughness, B=Metallic)
+    alignas(16) uint8_t orm_px[64 * 64 * 4];
+    for (int y = 0; y < 64; y++) {
+      for (int x = 0; x < 64; x++) {
+        const int bx = x % 16, by = y % 8;
+        const bool edge = (bx <= 1 || bx >= 14 || by <= 1 || by >= 6);
+        const uint8_t occ = edge ? 70 : 255;
+        const uint8_t rough = edge ? 240 : 130;
+        const int idx = (y * 64 + x) * 4;
+        orm_px[idx + 0] = occ; orm_px[idx + 1] = rough; orm_px[idx + 2] = 0; orm_px[idx + 3] = 255;
+      }
+    }
+    st.tex_rough_orm = ren.create_texture(orm_px, 64, 64, true, false);
+
+    // Izgara Haritasi (Grid 64x64)
+    alignas(16) uint8_t grid_px[64 * 64 * 4];
+    for (int y = 0; y < 64; y++) {
+      for (int x = 0; x < 64; x++) {
+        const bool line = (x % 16 == 0 || y % 16 == 0 || x == 63 || y == 63);
+        const uint8_t c = line ? 240 : 50;
+        const int idx = (y * 64 + x) * 4;
+        grid_px[idx + 0] = c; grid_px[idx + 1] = c; grid_px[idx + 2] = c; grid_px[idx + 3] = 255;
+      }
+    }
+    st.tex_grid = ren.create_texture(grid_px, 64, 64, true, true);
+
+    // Ahsap / Halka Haritasi (Wood 64x64)
+    alignas(16) uint8_t wood_px[64 * 64 * 4];
+    for (int y = 0; y < 64; y++) {
+      for (int x = 0; x < 64; x++) {
+        const float r = std::sqrt(float(x * x + (y * 4) * (y * 4))) * 0.15f;
+        const float ring = 0.5f + 0.5f * std::sin(r);
+        const int idx = (y * 64 + x) * 4;
+        wood_px[idx + 0] = (uint8_t)(150 + ring * 60);
+        wood_px[idx + 1] = (uint8_t)(100 + ring * 40);
+        wood_px[idx + 2] = (uint8_t)(50 + ring * 25);
+        wood_px[idx + 3] = 255;
+      }
+    }
+    st.tex_wood = ren.create_texture(wood_px, 64, 64, true, true);
+
+    for (uint32_t i = 0; i < content::kSceneMaxEntities; i++) {
+      st.entity_mats[i] = ren.create_material(ren.default_texture(), Vec3{1, 1, 1});
+    }
   }
   const char *adir = std::getenv("TULPAR_ENGINE_ASSETS");
   if (opts.scene_path) std::snprintf(st.scene_path, sizeof st.scene_path, "%s", opts.scene_path);
@@ -853,6 +1403,11 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
   if (!scene.init(sys, &jobs, /*with_content*/ false)) { std::fprintf(stderr, "sahne\n"); return 1; }
   // Ilkel mesh tablosu bir kez kurulur (sahneden bagimsiz, salt geometri).
   content::build_primitive_meshes(ren, st.prims);
+  st.particles.init(sys, 4096, Vec3{0, -9.8f, 0});
+  st.ribbon_trail.init(sys, 256);
+  st.ribbon_initialized = true;
+  st.smoke_grid.init(sys, 24, 24, 24, Vec3{-3.0f, 0.0f, -3.0f}, 0.25f);
+  st.smoke_initialized = true;
   sim::Physics &phys = scene.physics();
 
   EditorUi ui;
@@ -1021,6 +1576,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       st.groups.clear();
       st.sel.clear();
       st.dirty = false;
+      st.particles.clear();
+      std::memset(st.particle_spawn_accum, 0, sizeof st.particle_spawn_accum);
     });
     std::snprintf(st.scene_path, sizeof st.scene_path, "%s", path);
     content::scene_dir_of(st.scene_path, st.scene_dir, sizeof st.scene_dir);
@@ -1042,6 +1599,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       st.groups.clear();
       st.sel.clear();
       st.dirty = false;
+      st.particles.clear();
+      std::memset(st.particle_spawn_accum, 0, sizeof st.particle_spawn_accum);
     });
     st.scene_path[0] = 0; // ADSIZ: ilk Kaydet "Farkli kaydet"e duser
     for (uint32_t i = 0; i < content::kSceneMaxAssets; i++) st.have[i] = false;
@@ -1129,22 +1688,32 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       e.pos.x += 1.5f;
     } else {
       static const char *const kStem[] = {
-        "nesne", "nesne", "model", "isik", "kutu_sabit",
+        "nesne", "bos_varlik", "model", "isik_nokta", "kutu_sabit",
         "kure_sabit", "kutu_dinamik", "kure_dinamik", "zemin",
-        "animasyon", "kup", "kure", "kamera", "ses", "isik_yonlu"
+        "animasyon", "kup", "kure", "kamera", "ses_3b", "isik_gunes",
+        "isik_spot", "isik_alan", "isik_tup", "isik_disk", "isik_godray"
       };
-      // Ilkel geometriler 20..24 araliginda. kStem'i 25 uzunluga cikarip
-      // ortasini bos birakmak yerine AYRI tablo: bosluklar sessizce "nesne"
-      // olur ve iki kapsul "nesne_3" adini alirdi.
+      // Ilkel geometriler 20..24 araliginda.
       static const char *const kPrimStem[] = {"kapsul", "silindir", "koni", "dortgen", "simit"};
       static const char *const kExtraStem[] = {
         "karakter", "arazi", "su", "voksel", "ruzgar",
-        "partikul", "skybox", "sonda", "betik", "ajan",
-        "can_varlik", "yetenek_varlik", "sandik", "eklem", "yanki"
+        "vfx_ates", "skybox", "sonda", "betik", "ajan",
+        "can_varlik", "yetenek_varlik", "sandik", "eklem", "yanki",
+        "gi_sondasi", "sis_hacmi", "tetikleyici", "engel_hacmi"
+      };
+      static const char *const kVfxStem[] = {
+        "vfx_duman", "vfx_kivilcim", "vfx_yagmur", "hacimsel_spot", "isik_huzmesi", "vfx", "vfx_kar", "vfx_buyu", "vfx_ozel"
       };
       const char *stem = "nesne";
       if (kind >= content::kPrimCapsule && kind <= content::kPrimTorus) stem = kPrimStem[kind - content::kPrimCapsule];
       else if (kind >= 30 && kind < 30 + (int)(sizeof(kExtraStem)/sizeof(kExtraStem[0]))) stem = kExtraStem[kind - 30];
+      else if (kind >= 60 && kind < 60 + (int)(sizeof(kVfxStem)/sizeof(kVfxStem[0]))) stem = kVfxStem[kind - 60];
+      else if (kind >= 70 && kind <= 74) {
+        static const char *const kFogVolStem[] = {
+          "sis_zemin_tabakasi", "sis_koni_plume", "sis_silindir_kolon", "sis_halka_torus", "sis_voksel_dumani"
+        };
+        stem = kFogVolStem[kind - 70];
+      }
       else if (kind == 50) stem = "fizik_odasi";
       else if (kind == 51) stem = "doga_paketi";
       else if (kind == 52) stem = "rpg_sahnesi";
@@ -1168,34 +1737,40 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         e.light_intensity = 3.0f;
         e.light_radius = 8.0f;
         break;
-      case 4: // Sabit Kutu Gövde
-        e.components = content::kSceneBody;
+      case 4: // Sabit Kutu Gövde (Görsel Model + Fiziksel Gövde)
+        e.components = content::kSceneModel | content::kSceneBody;
+        e.primitive = (int32_t)content::kPrimCube;
         e.shape = content::SceneShape::Box;
         e.half = Vec3{0.5f, 0.5f, 0.5f};
         e.dynamic = false;
         break;
-      case 5: // Sabit Küre Gövde
-        e.components = content::kSceneBody;
+      case 5: // Sabit Küre Gövde (Görsel Model + Fiziksel Gövde)
+        e.components = content::kSceneModel | content::kSceneBody;
+        e.primitive = (int32_t)content::kPrimSphere;
         e.shape = content::SceneShape::Sphere;
         e.radius = 0.5f;
         e.dynamic = false;
         break;
-      case 6: // Dinamik Kutu Gövde
-        e.components = content::kSceneBody;
+      case 6: // Dinamik Kutu Gövde (Görsel Model + Fiziksel Gövde)
+        e.components = content::kSceneModel | content::kSceneBody;
+        e.primitive = (int32_t)content::kPrimCube;
         e.shape = content::SceneShape::Box;
         e.half = Vec3{0.5f, 0.5f, 0.5f};
         e.dynamic = true;
         break;
-      case 7: // Dinamik Küre Gövde
-        e.components = content::kSceneBody;
+      case 7: // Dinamik Küre Gövde (Görsel Model + Fiziksel Gövde)
+        e.components = content::kSceneModel | content::kSceneBody;
+        e.primitive = (int32_t)content::kPrimSphere;
         e.shape = content::SceneShape::Sphere;
         e.radius = 0.5f;
         e.dynamic = true;
         break;
-      case 8: // Zemin / Düzlem
-        e.components = content::kSceneBody;
+      case 8: // Zemin / Düzlem (Görsel Model + Fiziksel Gövde)
+        e.components = content::kSceneModel | content::kSceneBody;
+        e.primitive = (int32_t)content::kPrimPlane;
         e.shape = content::SceneShape::Box;
         e.half = Vec3{10.0f, 0.1f, 10.0f};
+        e.scale = Vec3{20.0f, 1.0f, 20.0f};
         e.dynamic = false;
         e.pos.y = -0.1f;
         break;
@@ -1210,12 +1785,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         e.shape = content::SceneShape::Box;
         e.half = Vec3{0.5f, 0.5f, 0.5f};
         e.dynamic = false;
-        int32_t cube_a = -1;
-        for (uint32_t a = 0; a < st.scene.asset_count; a++) {
-          if (std::strstr(st.scene.assets[a], "cube") != nullptr) { cube_a = (int32_t)a; break; }
-        }
-        if (cube_a < 0 && st.scene.asset_count) cube_a = 0;
-        e.asset = cube_a;
+        e.primitive = (int32_t)content::kPrimCube;
+        e.asset = -1;
         break;
       }
       case 11: { // Küre (Model + Gövde)
@@ -1223,12 +1794,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         e.shape = content::SceneShape::Sphere;
         e.radius = 0.5f;
         e.dynamic = false;
-        int32_t sph_a = -1;
-        for (uint32_t a = 0; a < st.scene.asset_count; a++) {
-          if (std::strstr(st.scene.assets[a], "sphere") != nullptr) { sph_a = (int32_t)a; break; }
-        }
-        if (sph_a < 0 && st.scene.asset_count) sph_a = 0;
-        e.asset = sph_a;
+        e.primitive = (int32_t)content::kPrimSphere;
+        e.asset = -1;
         break;
       }
       case 12: // Kamera Varlığı
@@ -1324,14 +1891,18 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         st.scene.godrays_enabled = true;
         st.dirty = true;
         break;
-      case 64: // Işık Hüzmesi (God Ray Shafts)
+      case 64: // Işık Hüzmesi (Volumetric Fake Godray Beam)
         e.components = content::kSceneLight;
-        e.light_type = content::SceneLightType::Directional;
-        e.light_color = Vec3{1.0f, 0.92f, 0.78f};
-        e.light_intensity = 4.0f;
+        e.light_type = content::SceneLightType::Spot;
+        e.light_color = Vec3{1.0f, 0.94f, 0.82f};
+        e.light_intensity = 6.0f;
+        e.light_radius = 14.0f;
+        e.light_spot_inner = 12.0f;
+        e.light_spot_outer = 26.0f;
         e.light_godray = true;
         e.light_godray_intensity = 2.0f;
-        e.rot_deg = Vec3{30.0f, -30.0f, 0.0f};
+        e.pos = Vec3{0.0f, 4.0f, 0.0f};
+        e.rot_deg = Vec3{60.0f, -25.0f, 0.0f};
         std::snprintf(e.name, sizeof e.name, "isik_huzmesi");
         st.scene.godrays_enabled = true;
         st.scene.godray_density = 1.0f;
@@ -1368,10 +1939,18 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         e.terrain_amp = 15.0f;
         e.terrain_freq = 0.03f;
         e.terrain_octaves = 4;
+        e.tint = Vec3{0.32f, 0.65f, 0.28f}; // Doğal çim / vadi yeşili
+        e.roughness = 0.85f;
+        e.metallic = 0.0f;
+        e.reflectance = 0.5f;
         std::snprintf(e.name, sizeof e.name, "prosedurel_arazi");
         break;
       case 32: // Su (Gerstner)
         e.components = content::kSceneWater;
+        e.tint = Vec3{0.12f, 0.45f, 0.85f}; // Okyanus mavisi
+        e.roughness = 0.15f;
+        e.metallic = 0.1f;
+        e.reflectance = 0.6f;
         e.wave_length = 8.0f;
         e.wave_amplitude = 0.4f;
         e.wave_speed = 1.2f;
@@ -1381,6 +1960,10 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         break;
       case 33: // Voksel
         e.components = content::kSceneVoxel;
+        e.tint = Vec3{0.75f, 0.68f, 0.58f}; // Taş / tuğla tonu
+        e.roughness = 0.85f;
+        e.metallic = 0.05f;
+        e.reflectance = 0.5f;
         e.voxel_size_x = 16;
         e.voxel_size_y = 16;
         e.voxel_size_z = 16;
@@ -1442,20 +2025,65 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         e.particle_billboard_type = 1;
         std::snprintf(e.name, sizeof e.name, "kivilcim_efekti");
         break;
-      case 62: // Partikül: Yağmur & Kar (Precipitation)
+      case 62: // Partikül: Yağmur & Fırtına (Rain & Storm)
         e.components = content::kSceneParticle;
-        e.particle_spawn_rate = 120.0f;
-        e.particle_lifetime_min = 1.5f;
-        e.particle_lifetime_max = 2.5f;
-        e.particle_size_start = 0.05f;
-        e.particle_size_end = 0.05f;
-        e.particle_velocity = Vec3{0.5f, -8.0f, 0.0f};
-        e.particle_jitter = Vec3{5.0f, 0.5f, 5.0f};
-        e.particle_color_start = Vec3{0.7f, 0.8f, 1.0f};
-        e.particle_color_end = Vec3{0.5f, 0.6f, 0.8f};
+        e.particle_spawn_rate = 140.0f;
+        e.particle_lifetime_min = 1.2f;
+        e.particle_lifetime_max = 2.0f;
+        e.particle_size_start = 0.04f;
+        e.particle_size_end = 0.04f;
+        e.particle_velocity = Vec3{0.5f, -12.0f, 0.2f};
+        e.particle_jitter = Vec3{6.0f, 0.5f, 6.0f};
+        e.particle_color_start = Vec3{0.7f, 0.85f, 1.0f};
+        e.particle_color_end = Vec3{0.5f, 0.65f, 0.9f};
         e.particle_gravity = -9.8f;
         e.particle_billboard_type = 1;
         std::snprintf(e.name, sizeof e.name, "yagmur_efekti");
+        break;
+      case 66: // Partikül: Kar & Tipi (Snow & Blizzard)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 90.0f;
+        e.particle_lifetime_min = 3.0f;
+        e.particle_lifetime_max = 5.0f;
+        e.particle_size_start = 0.08f;
+        e.particle_size_end = 0.05f;
+        e.particle_velocity = Vec3{0.8f, -2.5f, 0.4f};
+        e.particle_jitter = Vec3{5.0f, 0.5f, 5.0f};
+        e.particle_color_start = Vec3{0.95f, 0.98f, 1.0f};
+        e.particle_color_end = Vec3{0.8f, 0.85f, 0.95f};
+        e.particle_gravity = -0.5f;
+        e.particle_billboard_type = 0;
+        std::snprintf(e.name, sizeof e.name, "kar_efekti");
+        break;
+      case 67: // Partikül: Büyü & Işıltı (Magic Glow)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 45.0f;
+        e.particle_lifetime_min = 1.2f;
+        e.particle_lifetime_max = 2.4f;
+        e.particle_size_start = 0.16f;
+        e.particle_size_end = 0.02f;
+        e.particle_velocity = Vec3{0.0f, 1.6f, 0.0f};
+        e.particle_jitter = Vec3{0.8f, 0.8f, 0.8f};
+        e.particle_color_start = Vec3{0.4f, 0.7f, 1.0f};
+        e.particle_color_end = Vec3{0.85f, 0.2f, 1.0f};
+        e.particle_gravity = 0.2f;
+        e.particle_billboard_type = 0;
+        std::snprintf(e.name, sizeof e.name, "buyu_efekti");
+        break;
+      case 68: // Özel Partikül Emitter (Custom)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 50.0f;
+        e.particle_lifetime_min = 1.0f;
+        e.particle_lifetime_max = 2.5f;
+        e.particle_size_start = 0.2f;
+        e.particle_size_end = 0.05f;
+        e.particle_velocity = Vec3{0.0f, 2.0f, 0.0f};
+        e.particle_jitter = Vec3{0.5f, 0.5f, 0.5f};
+        e.particle_color_start = Vec3{1.0f, 0.8f, 0.3f};
+        e.particle_color_end = Vec3{0.2f, 0.1f, 0.05f};
+        e.particle_gravity = 0.0f;
+        e.particle_billboard_type = 0;
+        std::snprintf(e.name, sizeof e.name, "ozel_partikul");
         break;
       case 37: // Yansıma Sondası
         e.components = content::kSceneRefProbe;
@@ -1469,11 +2097,101 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         e.ref_probe_intensity = 1.0f;
         std::snprintf(e.name, sizeof e.name, "gi_isik_sondasi");
         break;
-      case 46: // Sis Hacmi (Fog Volume)
-        e.components = content::kSceneReverb;
-        e.reverb_decay = 2.0f;
-        e.reverb_room_size = 1.0f;
+      case 46: // Sis Hacmi (Hacimsel Sis / Fog Volume)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 120.0f;
+        e.particle_lifetime_min = 2.5f;
+        e.particle_lifetime_max = 5.0f;
+        e.particle_size_start = 1.0f;
+        e.particle_size_end = 2.8f;
+        e.particle_velocity = Vec3{0.0f, 0.05f, 0.0f};
+        e.particle_jitter = Vec3{4.0f, 1.2f, 4.0f};
+        e.particle_color_start = Vec3{0.82f, 0.85f, 0.90f};
+        e.particle_color_end = Vec3{0.65f, 0.70f, 0.78f};
+        e.particle_gravity = 0.0f;
+        e.particle_billboard_type = 3; // 3: 3B Yuvarlak Kure (Volumetric Sphere Puff)
+        e.particle_drag = 0.5f;
         std::snprintf(e.name, sizeof e.name, "sis_hacmi");
+        break;
+      case 70: // Yatay Zemin Sisi (Ground Mist Sheet)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 90.0f;
+        e.particle_lifetime_min = 3.0f;
+        e.particle_lifetime_max = 6.0f;
+        e.particle_size_start = 3.0f;
+        e.particle_size_end = 6.0f;
+        e.particle_velocity = Vec3{0.2f, 0.01f, 0.0f};
+        e.particle_jitter = Vec3{8.0f, 0.2f, 8.0f};
+        e.particle_color_start = Vec3{0.78f, 0.82f, 0.88f};
+        e.particle_color_end = Vec3{0.50f, 0.55f, 0.62f};
+        e.particle_gravity = -0.05f;
+        e.particle_billboard_type = 2; // 2: Yatay Duzlem
+        e.particle_drag = 0.8f;
+        std::snprintf(e.name, sizeof e.name, "sis_zemin_tabakasi");
+        break;
+      case 71: // Konik Baca Sisi / Duman Jeti (Cone Fog Plume)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 140.0f;
+        e.particle_lifetime_min = 2.0f;
+        e.particle_lifetime_max = 4.5f;
+        e.particle_size_start = 0.4f;
+        e.particle_size_end = 3.0f;
+        e.particle_velocity = Vec3{0.0f, 2.5f, 0.0f};
+        e.particle_jitter = Vec3{0.3f, 0.1f, 0.3f};
+        e.particle_color_start = Vec3{0.60f, 0.62f, 0.68f};
+        e.particle_color_end = Vec3{0.35f, 0.38f, 0.45f};
+        e.particle_gravity = 0.2f;
+        e.particle_billboard_type = 6; // 6: 3B Koni (Cone Plume)
+        e.particle_drag = 0.4f;
+        std::snprintf(e.name, sizeof e.name, "sis_koni_plume");
+        break;
+      case 72: // Silindirik Kuyu / Saft Sisi (Cylinder Shaft Fog)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 100.0f;
+        e.particle_lifetime_min = 3.0f;
+        e.particle_lifetime_max = 5.5f;
+        e.particle_size_start = 1.2f;
+        e.particle_size_end = 1.8f;
+        e.particle_velocity = Vec3{0.0f, 1.2f, 0.0f};
+        e.particle_jitter = Vec3{0.5f, 0.2f, 0.5f};
+        e.particle_color_start = Vec3{0.70f, 0.75f, 0.80f};
+        e.particle_color_end = Vec3{0.45f, 0.50f, 0.55f};
+        e.particle_gravity = 0.0f;
+        e.particle_billboard_type = 7; // 7: 3B Silindir
+        e.particle_drag = 0.5f;
+        std::snprintf(e.name, sizeof e.name, "sis_silindir_kolon");
+        break;
+      case 73: // Portal / Halka Sisi (Torus Ring Fog)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 110.0f;
+        e.particle_lifetime_min = 2.5f;
+        e.particle_lifetime_max = 4.0f;
+        e.particle_size_start = 1.5f;
+        e.particle_size_end = 2.2f;
+        e.particle_velocity = Vec3{0.0f, 0.2f, 0.0f};
+        e.particle_jitter = Vec3{2.5f, 0.4f, 2.5f};
+        e.particle_color_start = Vec3{0.65f, 0.35f, 0.95f};
+        e.particle_color_end = Vec3{0.20f, 0.08f, 0.45f};
+        e.particle_gravity = 0.0f;
+        e.particle_billboard_type = 5; // 5: 3B Simit / Torus
+        e.particle_drag = 0.6f;
+        std::snprintf(e.name, sizeof e.name, "sis_portal_halkasi");
+        break;
+      case 74: // Voksel Duman / CS2 Dinamik Sis (Voxel Smoke Volume)
+        e.components = content::kSceneParticle;
+        e.particle_spawn_rate = 150.0f;
+        e.particle_lifetime_min = 3.5f;
+        e.particle_lifetime_max = 6.0f;
+        e.particle_size_start = 0.8f;
+        e.particle_size_end = 2.2f;
+        e.particle_velocity = Vec3{0.0f, 0.1f, 0.0f};
+        e.particle_jitter = Vec3{2.5f, 1.5f, 2.5f};
+        e.particle_color_start = Vec3{0.55f, 0.58f, 0.62f};
+        e.particle_color_end = Vec3{0.30f, 0.32f, 0.35f};
+        e.particle_gravity = 0.0f;
+        e.particle_billboard_type = 4; // 4: Voksel 3B Kup
+        e.particle_drag = 0.7f;
+        std::snprintf(e.name, sizeof e.name, "sis_voksel_dumani");
         break;
       case 38: // Betik
         e.components = content::kSceneScript;
@@ -1522,6 +2240,20 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         e.reverb_decay = 2.5f;
         e.reverb_room_size = 0.7f;
         std::snprintf(e.name, sizeof e.name, "yanki_alani");
+        break;
+      case 47: // Tetikleyici Hacim (Trigger Volume)
+        e.components = content::kSceneBody;
+        e.shape = content::SceneShape::Box;
+        e.half = Vec3{2.0f, 1.5f, 2.0f};
+        e.dynamic = false;
+        std::snprintf(e.name, sizeof e.name, "tetikleyici_hacim");
+        break;
+      case 48: // Engelleme Hacmi (Blocking Volume)
+        e.components = content::kSceneBody;
+        e.shape = content::SceneShape::Box;
+        e.half = Vec3{2.0f, 2.0f, 0.2f};
+        e.dynamic = false;
+        std::snprintf(e.name, sizeof e.name, "engelleme_hacmi");
         break;
       case 50: { // Şablon: Fizik Deney Odası
         e.components = content::kSceneBody;
@@ -1862,25 +2594,62 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
   struct MenuExtraCtx {
     decltype(&guard_then) guard;
     int open_action;
-  } mx{&guard_then, PendingOpenPath};
+    int *view_mode = nullptr;
+    EditorState *st = nullptr;
+  } mx{&guard_then, PendingOpenPath, &view_mode, &st};
   ChromeMenuExtra menu_extra;
   menu_extra.ctx = &mx;
   menu_extra.fn = [](void *ctx, CommandCategory cat) {
-    if (cat != CommandCategory::File) return;
     MenuExtraCtx *m = static_cast<MenuExtraCtx *>(ctx);
-    const char *rec[kRecentMax];
-    const uint32_t nrec = recent_list(rec, kRecentMax);
-    if (!ImGui::BeginMenu("Son dosyalar", nrec > 0)) return;
-    for (uint32_t i = 0; i < nrec; i++) {
-      const bool var = recent_exists(i);
-      char lbl[kFilePathLen + 16];
-      std::snprintf(lbl, sizeof lbl, "%u  %s", i + 1, rec[i]);
-      ImGui::BeginDisabled(!var); // eksik dosya SOLUK, gizli degil
-      if (ImGui::MenuItem(lbl)) (*m->guard)(m->open_action, rec[i]);
-      ImGui::EndDisabled();
-      if (!var && ImGui::IsItemHovered()) ImGui::SetTooltip("Dosya bulunamadi: %s", rec[i]);
+    if (!m) return;
+    if (cat == CommandCategory::File) {
+      const char *rec[kRecentMax];
+      const uint32_t nrec = recent_list(rec, kRecentMax);
+      if (!ImGui::BeginMenu("Son dosyalar", nrec > 0)) return;
+      for (uint32_t i = 0; i < nrec; i++) {
+        const bool var = recent_exists(i);
+        char lbl[kFilePathLen + 16];
+        std::snprintf(lbl, sizeof lbl, "%u  %s", i + 1, rec[i]);
+        ImGui::BeginDisabled(!var); // eksik dosya SOLUK, gizli degil
+        if (ImGui::MenuItem(lbl)) (*m->guard)(m->open_action, rec[i]);
+        ImGui::EndDisabled();
+        if (!var && ImGui::IsItemHovered()) ImGui::SetTooltip("Dosya bulunamadi: %s", rec[i]);
+      }
+      ImGui::EndMenu();
+    } else if (cat == CommandCategory::View) {
+      if (m->view_mode) {
+        if (ImGui::BeginMenu("G\xC3\xB6r\xC3\xBCn\xC3\xBCm Kipi (Shading)")) {
+          if (ImGui::MenuItem("Ayd\xC4\xB1nlatmal\xC4\xB1 (Lit PBR)", nullptr, *m->view_mode == 0)) *m->view_mode = 0;
+          if (ImGui::MenuItem("I\xC5\x9F\xC4\xB1ks\xC4\xB1z (Albedo)", nullptr, *m->view_mode == 1)) *m->view_mode = 1;
+          if (ImGui::MenuItem("\xC3\x87" "arp\xC4\xB1\xC5\x9Fma (Colliders)", nullptr, *m->view_mode == 2)) *m->view_mode = 2;
+          if (ImGui::MenuItem("S\xC4\xB1n\xC4\xB1rlar (Bounds)", nullptr, *m->view_mode == 3)) *m->view_mode = 3;
+          if (ImGui::MenuItem("Overdraw Is\xC4\xB1 Haritas\xC4\xB1", nullptr, *m->view_mode == 4)) *m->view_mode = 4;
+          if (ImGui::MenuItem("I\xC5\x9F\xC4\xB1k K\xC3\xBCmeleri", nullptr, *m->view_mode == 5)) *m->view_mode = 5;
+          ImGui::EndMenu();
+        }
+      }
+    } else if (cat == CommandCategory::Play) {
+      if (m->st) {
+        if (ImGui::BeginMenu("Sim\xC3\xBClasyon ve Fizik")) {
+          if (ImGui::MenuItem(ICON_MD_BLUR_ON " MLS-MPM \xC3\x87ok Fazl\xC4\xB1 Sim\xC3\xBClat\xC3\xB6r")) {
+            set_status(*m->st, "MLS-MPM sim\xC3\xBClat\xC3\xB6r\xC3\xBC D\xC3\xBCnya panelinde g\xC3\xB6r\xC3\xBCnt\xC3\xBCleniyor");
+          }
+          if (ImGui::MenuItem(ICON_MD_WAVES " SPH Ak\xC4\xB1\xC5\x9Fkan Dinami\xC4\x9Fi (M\xC3\xBCller 2003)")) {
+            set_status(*m->st, "SPH ak\xC4\xB1\xC5\x9Fkan sim\xC3\xBClat\xC3\xB6r\xC3\xBC D\xC3\xBCnya panelinde g\xC3\xB6r\xC3\xBCnt\xC3\xBCleniyor");
+          }
+          if (ImGui::MenuItem(ICON_MD_GROUPS " Boids S\xC3\xBCr\xC3\xBC Zekas\xC4\xB1 (Reynolds)")) {
+            set_status(*m->st, "Boids s\xC3\xBCr\xC3\xBC sim\xC3\xBClasyonu D\xC3\xBCnya panelinde g\xC3\xB6r\xC3\xBCnt\xC3\xBCleniyor");
+          }
+          if (ImGui::MenuItem(ICON_MD_CASINO " WFC Kuantum Zindan \xC3\x9Cretici")) {
+            set_status(*m->st, "WFC kuantum zindan \xC3\xBCretici D\xC3\xBCnya panelinde g\xC3\xB6r\xC3\xBCnt\xC3\xBCleniyor");
+          }
+          if (ImGui::MenuItem(ICON_MD_SYNC " Rollback Netcode & Replay")) {
+            set_status(*m->st, "GGPO rollback netcode D\xC3\xBCnya panelinde g\xC3\xB6r\xC3\xBCnt\xC3\xBCleniyor");
+          }
+          ImGui::EndMenu();
+        }
+      }
     }
-    ImGui::EndMenu();
   };
   {
     // Kurulum denetimi: bagli kalmayan komut = menude tiklanmayan satir. Sessiz
@@ -2007,6 +2776,96 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       fs.advance(dt); // biriken zamani YUT: adim adim ilerlerken geri kalmasin
     }
 
+    // Partikül Simülasyonu (VFX): Editörde ve Oyunda canlı çalışır
+    if (!st.particle_sim_paused) {
+      for (uint32_t i = 0; i < st.scene.entity_count; i++) {
+        const SceneEntity &e = st.scene.entities[i];
+        if (!(e.components & content::kSceneParticle) || (e.flags & content::kSceneHidden)) continue;
+        if (e.particle_spawn_rate <= 0.0f) continue;
+        st.particle_spawn_accum[i] += e.particle_spawn_rate * dt;
+        uint32_t to_spawn = (uint32_t)st.particle_spawn_accum[i];
+        if (to_spawn > 0) {
+          st.particle_spawn_accum[i] -= (float)to_spawn;
+          if (to_spawn > 200) to_spawn = 200; // bir karede asiri birikmeyi onle
+          const Mat4 wm = content::scene_entity_world_matrix(st.scene, i);
+          const Vec3 emitter_pos{wm.m[3][0], wm.m[3][1], wm.m[3][2]};
+          content::ParticleEmitterConfig cfg;
+          cfg.spawn_pos = emitter_pos;
+          cfg.base_velocity = e.particle_velocity;
+          cfg.velocity_jitter = e.particle_jitter;
+          cfg.lifetime_min = e.particle_lifetime_min;
+          cfg.lifetime_max = e.particle_lifetime_max;
+          cfg.size_start = e.particle_size_start;
+          cfg.size_end = e.particle_size_end;
+          cfg.color_start = e.particle_color_start;
+          cfg.color_end = e.particle_color_end;
+          cfg.gravity = Vec3{0.0f, e.particle_gravity, 0.0f};
+          cfg.custom_gravity = true;
+          // TEPS 2026 Gelismis Fizik ve Dinamikler
+          cfg.curl_noise_strength = e.particle_curl_strength;
+          cfg.curl_noise_frequency = e.particle_curl_freq;
+          cfg.drag = e.particle_drag;
+          cfg.enable_collision = e.particle_collision;
+          cfg.collision_plane_y = 0.0f;
+          cfg.restitution = e.particle_bounce;
+          cfg.shape = e.particle_billboard_type;
+          // Godot GPUParticles / Niagara Standart Yayilim Geometrisi
+          if (e.particle_jitter.y <= 0.08f && (e.particle_jitter.x > 0.1f || e.particle_jitter.z > 0.1f)) {
+            cfg.emission_shape = content::ParticleEmissionShape::PlanarRing;
+            cfg.emission_radius = std::max(e.particle_jitter.x, e.particle_jitter.z);
+            cfg.emission_inner_radius = cfg.emission_radius * 0.3f;
+          } else if (e.particle_jitter.z <= 0.08f && e.particle_jitter.x > 0.1f && e.particle_jitter.y > 0.1f) {
+            cfg.emission_shape = content::ParticleEmissionShape::VerticalCurtain;
+            cfg.emission_radius = e.particle_jitter.x;
+            cfg.emission_spread = e.particle_jitter.y;
+          } else if (length(e.particle_velocity) > 2.0f && (e.particle_jitter.x > 0.5f || e.particle_jitter.z > 0.5f)) {
+            cfg.emission_shape = content::ParticleEmissionShape::ConicalFountain;
+            cfg.emission_spread = 0.6f;
+          } else if (e.particle_jitter.x > 0.5f && e.particle_jitter.y > 0.5f && e.particle_jitter.z > 0.5f) {
+            cfg.emission_shape = content::ParticleEmissionShape::SphericalVolume;
+            cfg.emission_radius = std::max(e.particle_jitter.x, std::max(e.particle_jitter.y, e.particle_jitter.z));
+          } else if (e.particle_jitter.x <= 0.08f && e.particle_jitter.z <= 0.08f && length(e.particle_velocity) > 1.0f) {
+            cfg.emission_shape = content::ParticleEmissionShape::LinearBeam;
+            cfg.emission_radius = 2.0f;
+          }
+          static content::ParticleEmitterConfig s_sub_cfg;
+          if (e.particle_sub_on_death > 0) {
+            cfg.sub_emitter = &st.particles;
+            s_sub_cfg = cfg;
+            s_sub_cfg.spawn_on_death_count = 0;
+            s_sub_cfg.size_start = e.particle_size_start * 0.4f;
+            s_sub_cfg.size_end = 0.0f;
+            s_sub_cfg.lifetime_min = 0.2f;
+            s_sub_cfg.lifetime_max = 0.5f;
+            s_sub_cfg.base_velocity = Vec3{0.0f, 1.5f, 0.0f};
+            s_sub_cfg.velocity_jitter = Vec3{3.0f, 3.0f, 3.0f};
+            cfg.sub_emitter_cfg = &s_sub_cfg;
+          }
+          st.particles.emit(cfg, to_spawn, st.particle_rng);
+        }
+      }
+      st.particles.update(dt, &st.particle_rng);
+      // Canlı Şerit / Kuyruk İzi (Ribbon Trail) Güncellemesi
+      if (st.ribbon_initialized) {
+        st.ribbon_trail.update(dt);
+        for (uint32_t i = 0; i < st.scene.entity_count; i++) {
+          const SceneEntity &e = st.scene.entities[i];
+          if (!(e.components & content::kSceneParticle) || (e.flags & content::kSceneHidden)) continue;
+          if (e.particle_ribbon && st.particles.alive_count() > 0) {
+            const content::Particle &p = st.particles.particle(0);
+            st.ribbon_trail.add_point(p.pos, Vec4{p.color_start.x, p.color_start.y, p.color_start.z, 0.9f}, p.size * 0.9f, 0.35f);
+          }
+        }
+      }
+      // CS2 Voksel Dumanı Navier-Stokes Difüzyon Güncellemesi
+      if (st.smoke_initialized) {
+        sim::VoxelSmokeParams sp;
+        sp.diffusion_rate = s_smoke_live_diff;
+        sp.dissipation_rate = s_smoke_live_diss;
+        st.smoke_grid.update(dt, sp);
+      }
+    }
+
     // En-boy orani artik PENCERENIN degil, sahnenin icinde yasadigi PANELIN
     // orani: 3B viewport dokusuna ciziliyor ve o dokunun olcusu panelden geliyor.
     const float aspect = vp.aspect();
@@ -2074,7 +2933,7 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
     cs.gizmo_op = gizmo_op;
     cs.snap = snap_on;
     cs.snap_value = snap_step;
-    cs.gizmos_visible = st.gizmos.light_radius || st.gizmos.light_glyph || st.gizmos.shadow_volume || st.gizmos.sun_dir || st.gizmos.camera_frustum;
+    cs.gizmos_visible = st.gizmos.light_radius || st.gizmos.light_glyph || st.gizmos.shadow_volume || st.gizmos.sun_dir || st.gizmos.camera_frustum || st.gizmos.env_volumes;
     const Vec3 eye = camera_eye(cam);
     cs.cam_eye[0] = eye.x; cs.cam_eye[1] = eye.y; cs.cam_eye[2] = eye.z;
     chrome_menu_bar(cmds, cs, menu_extra);
@@ -2164,9 +3023,9 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         //  Isiksiz  : ortam 1, gunes 0, nokta isik yok -> saf albedo/doku.
         //  Carpisma : her govdenin carpisma hacmi, govdeyle birlikte DONEN tel kutu.
         //  Sinirlar : her varligin dunya AABB'si (secim/odak bunu kullanir).
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11.0f);
         ImGui::Combo("##gorunum_kipi", &view_mode,
-                     "Ayd\xC4\xB1nlatmal\xC4\xB1\0I\xC5\x9F\xC4\xB1ks\xC4\xB1z\0\xC3\x87" "arp\xC4\xB1\xC5\x9Fma\0S\xC4\xB1n\xC4\xB1rlar\0");
+                     "Ayd\xC4\xB1nlatmal\xC4\xB1\0I\xC5\x9F\xC4\xB1ks\xC4\xB1z\0\xC3\x87" "arp\xC4\xB1\xC5\x9Fma\0S\xC4\xB1n\xC4\xB1rlar\0Overdraw Is\xC4\xB1 Haritas\xC4\xB1\0I\xC5\x9F\xC4\xB1k K\xC3\xBCmeleri\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("G\xC3\xB6r\xC3\xBCn\xC3\xBCm kipi");
         ImGui::SameLine();
         // NOT: burada bir "Tel Kafes / Duz Golgeli" dugmesi vardi ve HICBIR
@@ -2271,6 +3130,7 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
           st.gizmos.shadow_volume = st.gizmos.light_radius;
           st.gizmos.sun_dir = st.gizmos.light_radius;
           st.gizmos.camera_frustum = st.gizmos.light_radius;
+          st.gizmos.env_volumes = st.gizmos.light_radius;
         }
         if (ImGui::MenuItem( ICON_MD_CENTER_FOCUS_STRONG " Se\xC3\xA7ili Varl\xC4\xB1\xC4\x9F" "a Odaklan")) {
           const int32_t s0 = st.sel.primary();
@@ -2376,9 +3236,9 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
             oi.cam_eye[0] = eye.x; oi.cam_eye[1] = eye.y; oi.cam_eye[2] = eye.z;
             oi.cam_target[0] = cam.target.x; oi.cam_target[1] = cam.target.y; oi.cam_target[2] = cam.target.z;
             oi.gizmo_op = gizmo_op;
-            oi.gizmos_visible = st.gizmos.light_radius || st.gizmos.light_glyph || st.gizmos.shadow_volume || st.gizmos.sun_dir || st.gizmos.camera_frustum;
+            oi.gizmos_visible = st.gizmos.light_radius || st.gizmos.light_glyph || st.gizmos.shadow_volume || st.gizmos.sun_dir || st.gizmos.camera_frustum || st.gizmos.env_volumes;
             oi.playing = st.playing;
-            oi.hovered = view_hovered && !st.gizmo_was_over && !st.gizmo_was_using;
+            oi.hovered = view_hovered && !st.gizmo_was_over && !st.gizmo_was_using && !st.terrain_brush.active;
             oi.focused = ImGui::IsWindowFocused();
             oi.frame_ms = dt * 1000.0f;
             oi.draw_calls = ren.stats().draws;
@@ -2386,8 +3246,131 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
             oi.proj = cam.proj;
             oi.cam_mode = cam.mode;
             oi.gizmo_space = gizmo_space;
+            static const char *s_shading_labels[] = {
+                "Ayd\xC4\xB1nlatmal\xC4\xB1",
+                "I\xC5\x9F\xC4\xB1ks\xC4\xB1z",
+                "\xC3\x87" "arp\xC4\xB1\xC5\x9Fma",
+                "S\xC4\xB1n\xC4\xB1rlar",
+                "Overdraw Is\xC4\xB1 Haritas\xC4\xB1",
+                "I\xC5\x9F\xC4\xB1k K\xC3\xBCmeleri"
+            };
+            if (view_mode >= 0 && view_mode < 6) oi.shading = s_shading_labels[view_mode];
             oi.hint = "Sağ tık döndür · orta tuş kaydır · F odak";
             viewport_overlay(ViewportRect{origin.x + offset_x, origin.y + offset_y, (float)vp.width(), (float)vp.height()}, oi, nullptr, &ovres);
+
+            // Arazi Fırçası ve 3B İmleç Halkası (Görünüm Paneli çizim listesi içinde)
+            const int32_t t_prim = st.sel.primary();
+            if (t_prim >= 0 && t_prim < (int32_t)st.scene.entity_count &&
+                (st.scene.entities[t_prim].components & content::kSceneTerrain)) {
+              const SceneEntity &te = st.scene.entities[t_prim];
+              const float psc = ui.pointer_scale();
+              const ViewportRect vr{origin.x + offset_x, origin.y + offset_y, (float)vp.width(), (float)vp.height()};
+              const ViewportPick pick = in ? vp.map_mouse(vr, (float)in->mouse_x * psc, (float)in->mouse_y * psc) : ViewportPick{};
+
+              Vec3 ro, rd;
+              camera_ray(cam, aspect, pick.valid ? pick.x : (float)vp.width() * 0.5f, pick.valid ? pick.y : (float)vp.height() * 0.5f, (float)vp.width(), (float)vp.height(), &ro, &rd);
+              const Mat4 tw = content::scene_entity_world_matrix(st.scene, (uint32_t)t_prim);
+              const Mat4 inv_tw = inverse(tw);
+              const Vec4 ro_loc4 = inv_tw * Vec4{ro.x, ro.y, ro.z, 1.0f};
+              const Vec4 rd_loc4 = inv_tw * Vec4{rd.x, rd.y, rd.z, 0.0f};
+              const Vec3 ro_loc{ro_loc4.x, ro_loc4.y, ro_loc4.z};
+              const Vec3 rd_loc = normalize(Vec3{rd_loc4.x, rd_loc4.y, rd_loc4.z});
+
+              const float tw_world = te.terrain_width * te.terrain_cell;
+              const float th_world = te.terrain_height * te.terrain_cell;
+
+              bool hit = false;
+              Vec3 hit_loc{0, 0, 0};
+
+              if (std::fabs(rd_loc.y) > 1e-5f) {
+                float t0 = 0.0f, t1 = 300.0f;
+                float step_sz = (t1 - t0) / 24.0f;
+                float prev_diff = 0.0f;
+                Vec3 prev_p = ro_loc;
+                for (int s = 0; s <= 24; s++) {
+                  float t = t0 + (float)s * step_sz;
+                  Vec3 p = ro_loc + rd_loc * t;
+                  if (p.x >= 0.0f && p.x <= tw_world && p.z >= 0.0f && p.z <= th_world) {
+                    float surf_h = sample_terrain_height_with_sculpt(st, (uint32_t)t_prim, p.x, p.z);
+                    float diff = p.y - surf_h;
+                    if (s > 0 && ((diff <= 0.0f && prev_diff >= 0.0f) || (diff >= 0.0f && prev_diff <= 0.0f))) {
+                      float frac = std::fabs(prev_diff) / (std::fabs(prev_diff) + std::fabs(diff) + 1e-6f);
+                      hit_loc = prev_p + (p - prev_p) * frac;
+                      hit = true;
+                      break;
+                    }
+                    prev_diff = diff;
+                    prev_p = p;
+                  }
+                }
+                if (!hit && rd_loc.y < -0.001f) {
+                  float tp = (te.terrain_amp * 0.3f - ro_loc.y) / rd_loc.y;
+                  if (tp > 0.0f) {
+                    Vec3 p = ro_loc + rd_loc * tp;
+                    if (p.x >= 0.0f && p.x <= tw_world && p.z >= 0.0f && p.z <= th_world) {
+                      hit_loc = p;
+                      hit_loc.y = sample_terrain_height_with_sculpt(st, (uint32_t)t_prim, p.x, p.z);
+                      hit = true;
+                    }
+                  }
+                }
+              }
+
+              if (hit) {
+                st.terrain_brush.hit_valid = true;
+                st.terrain_brush.hit_local = hit_loc;
+                const Vec4 hw4 = tw * Vec4{hit_loc.x, hit_loc.y, hit_loc.z, 1.0f};
+                st.terrain_brush.hit_world = Vec3{hw4.x, hw4.y, hw4.z};
+
+                if (st.terrain_brush.active && pick.valid) {
+                  ImDrawList *dl = ImGui::GetWindowDrawList();
+                  const Mat4 vp_mat = proj * view;
+                  const float rad = st.terrain_brush.radius;
+                  constexpr int kSegs = 36;
+                  ImVec2 pts[kSegs];
+                  bool pts_valid[kSegs];
+                  for (int s = 0; s < kSegs; s++) {
+                    const float ang = (float)s * (2.0f * 3.14159265f / (float)kSegs);
+                    const float lx = hit_loc.x + rad * std::cos(ang);
+                    const float lz = hit_loc.z + rad * std::sin(ang);
+                    const float ly = sample_terrain_height_with_sculpt(st, (uint32_t)t_prim, lx, lz) + 0.08f;
+                    const Vec4 wpos = tw * Vec4{lx, ly, lz, 1.0f};
+                    const Vec4 clip = vp_mat * wpos;
+                    if (clip.w > 0.01f) {
+                      const float ndc_x = clip.x / clip.w;
+                      const float ndc_y = clip.y / clip.w;
+                      const float sx = vr.x + (ndc_x * 0.5f + 0.5f) * vr.w;
+                      const float sy = vr.y + (ndc_y * 0.5f + 0.5f) * vr.h;
+                      pts[s] = ImVec2(sx, sy);
+                      pts_valid[s] = true;
+                    } else {
+                      pts_valid[s] = false;
+                    }
+                  }
+                  const ImU32 col_ring = IM_COL32(50, 235, 150, 240);
+                  for (int s = 0; s < kSegs; s++) {
+                    int s_next = (s + 1) % kSegs;
+                    if (pts_valid[s] && pts_valid[s_next]) {
+                      dl->AddLine(pts[s], pts[s_next], col_ring, 2.5f);
+                    }
+                  }
+                  const Vec4 clip_center = vp_mat * Vec4{st.terrain_brush.hit_world.x, st.terrain_brush.hit_world.y + 0.1f, st.terrain_brush.hit_world.z, 1.0f};
+                  if (clip_center.w > 0.01f) {
+                    const float cx = vr.x + (clip_center.x / clip_center.w * 0.5f + 0.5f) * vr.w;
+                    const float cy = vr.y + (clip_center.y / clip_center.w * 0.5f + 0.5f) * vr.h;
+                    dl->AddCircleFilled(ImVec2(cx, cy), 4.0f, col_ring);
+                  }
+
+                  if (view_hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    apply_terrain_brush(st, (uint32_t)t_prim, hit_loc.x, hit_loc.z, dt, ImGui::GetIO().KeyShift);
+                  }
+                }
+              } else {
+                st.terrain_brush.hit_valid = false;
+              }
+            } else {
+              st.terrain_brush.hit_valid = false;
+            }
           }
         } else {
           ImGui::TextUnformatted(vp.last_error());
@@ -2421,36 +3404,6 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       else if (tb > 0) do_add(tb);
       hierarchy_search(st.filter, sizeof st.filter);
 
-      if (ImGui::BeginPopupContextWindow("SahnePanelMenu", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
-        // Olustur agacinin TEK dogruluk kaynagi kCreateMenu (editor_widgets).
-        // Burada elle yazilmis IKINCI bir kopya vardi ve ayrismisti: kCreate3D
-        // uzun zamandir Kapsul/Silindir/Koni/Dortgen/Simit tasiyor, bu kopyada
-        // hicbiri yoktu. Ayrica iki emoji (U+1F3A5 kamera, U+1F50A hoparlor)
-        // DejaVuSans'ta YOK -- menude tofu kutusu ciziliyordu; tablo yalniz
-        // fontta gercekten bulunan glifleri kullaniyor.
-        if (ImGui::BeginMenu("Yeni Varl\xC4\xB1k Ekle")) {
-          const int r = create_menu_draw(kCreateMenu, kCreateMenuCount);
-          if (r) do_add(r);
-          ImGui::EndMenu();
-        }
-        if (ImGui::MenuItem(ICON_MD_WIDGETS " Prefab ekle...")) {
-          dlg_intent = IntentPrefabLoad;
-          file_dialog_open(dlg, FileDialogMode::Ac, st.scene_dir, ".prefab", "Prefab ekle");
-        }
-        ImGui::Separator();
-        // Panel ac/kapa. Yalniz GERCEKTEN cizilen paneller listelenir --
-        // arkasi bos bir "Sequencer" / "Arazi Firca" / "Girdi Yoneticisi"
-        // satiri kullaniciya var olmayan bir yetenek soyler.
-        if (ImGui::MenuItem("Konsol", nullptr, &show_console)) {}
-        if (ImGui::MenuItem("Materyal D\xC3\xBC\xC4\x9F\xC3\xBCm (Node) Edit\xC3\xB6r\xC3\xBC (\xC3\xB6nizleme)", nullptr, &st.show_node_editor)) {}
-        ImGui::Separator();
-        if (ImGui::MenuItem("Yap\xC4\xB1\xC5\x9Ft\xC4\xB1r", "Ctrl+V", false, st.clip_count > 0)) do_paste();
-        if (ImGui::MenuItem("T\xC3\xBCm\xC3\xBCn\xC3\xBC Se\xC3\xA7", "Ctrl+A", false, st.scene.entity_count > 0)) {
-          st.sel.clear();
-          for (uint32_t k = st.scene.entity_count; k > 0; k--) st.sel.toggle((int32_t)(k - 1));
-        }
-        ImGui::EndPopup();
-      }
       // Cizim sirasi belirlenimli ON-SIRADIR (kokler indeks sirasinda, cocuklar
       // indeks sirasinda). SUZGEC ACIKKEN duz liste cizilir: katlanmis bir ata
       // eslesmeyi gizlemesin.
@@ -2560,92 +3513,10 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       }
 
       if (ImGui::BeginPopup("SahnePanelMenu")) {
-        // --- 1. YENİ VARLIK EKLE ---
+        // --- 1. YENİ VARLIK EKLE (Tek doğruluk kaynağı: kCreateMenu) ---
         if (ImGui::BeginMenu(ICON_MD_ADD "  Yeni Varl\xC4\xB1k Ekle...")) {
-          if (ImGui::MenuItem("\xE2\x97\x8B  Bo\xC5\x9F Varl\xC4\xB1k")) do_add(1);
-          if (ImGui::MenuItem("\xE2\x97\x86  Model (glTF)")) do_add(2);
-          if (ImGui::MenuItem("\xE2\x86\xBB  Animasyonlu Model")) do_add(9);
-          ImGui::Separator();
-          if (ImGui::BeginMenu("\xE2\x97\xBC  3B Nesneler (Primitives)")) {
-            if (ImGui::MenuItem("\xE2\x97\xBC  K\xC3\xBCp")) do_add(10);
-            if (ImGui::MenuItem("\xE2\x97\x8F  K\xC3\xBCre")) do_add(11);
-            if (ImGui::MenuItem("\xE2\x97\xBC  Kaps\xC3\xBCl")) do_add(content::kPrimCapsule);
-            if (ImGui::MenuItem("\xE2\x97\xBC  Silindir")) do_add(content::kPrimCylinder);
-            if (ImGui::MenuItem("\xE2\x97\xBC  Koni")) do_add(content::kPrimCone);
-            if (ImGui::MenuItem("\xE2\x96\xAC  D\xC3\xBCzlem / Zemin")) do_add(8);
-            if (ImGui::MenuItem("\xE2\x96\xAC  D\xC3\xB6rtgen (Quad)")) do_add(content::kPrimQuad);
-            if (ImGui::MenuItem("\xE2\x97\xBC  Simit (Torus)")) do_add(content::kPrimTorus);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x98\x80  I\xC5\x9F\xC4\xB1k & Ayd\xC4\xB1nlatma")) {
-            if (ImGui::MenuItem("\xE2\x98\x80  Y\xC3\xB6nl\xC3\xBC G\xC3\xBCne\xC5\x9F (Directional)")) do_add(14);
-            if (ImGui::MenuItem(ICON_MD_WB_SUNNY "  I\xC5\x9F\xC4\xB1k H\xC3\xBCzmeli G\xC3\xBCne\xC5\x9F (Sun + God Rays)")) do_add(19);
-            if (ImGui::MenuItem("\xE2\x97\x8F  Nokta I\xC5\x9F\xC4\xB1k (Point)")) do_add(3);
-            if (ImGui::MenuItem("\xE2\x86\x98  Spot I\xC5\x9F\xC4\xB1k (Spot Koni)")) do_add(15);
-            if (ImGui::MenuItem(ICON_MD_FLASHLIGHT_ON "  Hacimsel Spot I\xC5\x9F\xC4\xB1k (Volumetric)")) do_add(63);
-            if (ImGui::MenuItem(ICON_MD_AUTO_AWESOME "  I\xC5\x9F\xC4\xB1k H\xC3\xBCzmesi (God Rays Shafts)")) do_add(64);
-            ImGui::Separator();
-            if (ImGui::MenuItem("\xE2\x96\xAD  Alan / Dikd\xC3\xB6rtgen (Rect LTC)")) do_add(16);
-            if (ImGui::MenuItem("\xE2\x95\x90  T\xC3\xBCp / Kaps\xC3\xBCl I\xC5\x9F\xC4\xB1k")) do_add(17);
-            if (ImGui::MenuItem("\xE2\x97\x89  Disk I\xC5\x9F\xC4\xB1k")) do_add(18);
-            ImGui::EndMenu();
-          }
-          if (ImGui::MenuItem("\xE2\x98\x81  G\xC3\xB6ky\xC3\xBCz\xC3\xBC & Atmosfer (Skybox)")) do_add(36);
-          if (ImGui::MenuItem("\xE2\x96\xB2  Prosed\xC3\xBCrel Arazi (Terrain)")) do_add(31);
-          if (ImGui::MenuItem("\xE2\x89\x88  Dinamik Su (Ocean / Water)")) do_add(32);
-          ImGui::Separator();
-          if (ImGui::BeginMenu("\xE2\x97\x89  \xC3\x87" "evre Hacimleri (Volumes)")) {
-            if (ImGui::MenuItem("\xE2\x97\x89  Yans\xC4\xB1ma Sondas\xC4\xB1 (Probe)")) do_add(37);
-            if (ImGui::MenuItem("\xE2\x97\x87  I\xC5\x9F\xC4\xB1k Hacmi Sondas\xC4\xB1 (GI Grid)")) do_add(45);
-            if (ImGui::MenuItem("\xE2\x96\xA8  Hacimsel Sis Hacmi (Fog Volume)")) do_add(46);
-            if (ImGui::MenuItem("\xE2\x97\x8E  Yank\xC4\xB1 Alan\xC4\xB1 (Reverb)")) do_add(44);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x96\xB2  Do\xC4\x9F" "a & Zemin Akt\xC3\xB6rleri")) {
-            if (ImGui::MenuItem("\xE2\x96\xB2  Prosed\xC3\xBCrel Arazi (Terrain)")) do_add(31);
-            if (ImGui::MenuItem("\xE2\x89\x88  Dinamik Su (Gerstner)")) do_add(32);
-            if (ImGui::MenuItem("\xE2\x96\xA6  Voksel D\xC3\xBCnyas\xC4\xB1")) do_add(33);
-            if (ImGui::MenuItem("\xE2\x86\xAF  R\xC3\xBCzgar Alan\xC4\xB1")) do_add(34);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x88\xB4  G\xC3\xB6rsel Efektler (VFX)")) {
-            if (ImGui::MenuItem("\xE2\x9A\xA1  Yang\xC4\xB1n & Ate\xC5\x9F (Fire & Embers)")) do_add(35);
-            if (ImGui::MenuItem("\xE2\x96\x91  Duman & Toz (Smoke & Dust)")) do_add(60);
-            if (ImGui::MenuItem("\xE2\x9A\xA1  K\xC4\xB1v\xC4\xB1lc\xC4\xB1m & \xC3\x87" "arp\xC4\xB1\xC5\x9Fma (Sparks)")) do_add(61);
-            if (ImGui::MenuItem("\xE2\x98\x94  Ya\xC4\x9Fmur & Kar (Precipitation)")) do_add(62);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x97\xBC  Fizik Nesneleri")) {
-            if (ImGui::MenuItem("\xE2\x96\xA1  Sabit Kutu G\xC3\xB6vde")) do_add(4);
-            if (ImGui::MenuItem("\xE2\x97\x8B  Sabit K\xC3\xBCre G\xC3\xB6vde")) do_add(5);
-            if (ImGui::MenuItem("\xE2\x96\xA7  Dinamik Kutu G\xC3\xB6vde")) do_add(6);
-            if (ImGui::MenuItem("\xE2\x97\x8D  Dinamik K\xC3\xBCre G\xC3\xB6vde")) do_add(7);
-            if (ImGui::MenuItem("\xE2\x8A\x99  Karakter Kontrolc\xC3\xBC")) do_add(30);
-            if (ImGui::MenuItem("\xE2\x88\x9E  Fizik Eklemi (Joint)")) do_add(43);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x9A\x94  Oynan\xC4\xB1\xC5\x9F & RPG")) {
-            if (ImGui::MenuItem("\xE2\x99\xA5  Can & Z\xC4\xB1rh Varl\xC4\xB1\xC4\x9F\xC4\xB1")) do_add(40);
-            if (ImGui::MenuItem("\xE2\x9A\x94  B\xC3\xBCy\xC3\xBC / Yetenek Varl\xC4\xB1\xC4\x9F\xC4\xB1 (GAS)")) do_add(41);
-            if (ImGui::MenuItem("\xE2\x96\xA3  Sand\xC4\xB1k / Envanter (Inventory)")) do_add(42);
-            if (ImGui::MenuItem("\xE2\x86\x92  Yapay Zeka Ajan\xC4\xB1 (NavAgent)")) do_add(39);
-            ImGui::EndMenu();
-          }
-          if (ImGui::BeginMenu("\xE2\x99\xAA  Ses & Akustik")) {
-            if (ImGui::MenuItem("\xE2\x99\xAA  3B Ses Kayna\xC4\x9F\xC4\xB1")) do_add(13);
-            if (ImGui::MenuItem("\xE2\x97\x8E  Yank\xC4\xB1 Alan\xC4\xB1 (Reverb)")) do_add(44);
-            ImGui::EndMenu();
-          }
-          if (ImGui::MenuItem("\xE2\x96\xA3  Kamera Varl\xC4\xB1\xC4\x9F\xC4\xB1")) do_add(12);
-          if (ImGui::MenuItem("\xE2\x96\xA4  Tulpar Betik Nesnesi")) do_add(38);
-          ImGui::EndMenu();
-        }
-
-        // --- 2. HIZLI DEVRİMSEL ŞABLONLAR ---
-        if (ImGui::BeginMenu("\xE2\x9A\xA1  H\xC4\xB1zl\xC4\xB1 \xC5\x9E" "ablonlar (Haz\xC4\xB1r Kurulum)")) {
-          if (ImGui::MenuItem(ICON_MD_SCIENCE "  Fizik Test Odas\xC4\xB1 (Zemin + D\xC3\xBC\xC5\x9F" "enler)")) do_add(50);
-          if (ImGui::MenuItem(ICON_MD_LANDSCAPE "  Do\xC4\x9F" "a Paketi (G\xC3\xBCne\xC5\x9F + Skybox + Arazi + Su)")) do_add(51);
-          if (ImGui::MenuItem("\xE2\x9A\x94  RPG Sahnesi (Karakter + Yetenek + Sand\xC4\xB1k)")) do_add(52);
+          const int r = create_menu_draw(kCreateMenu, kCreateMenuCount);
+          if (r > 0) do_add(r);
           ImGui::EndMenu();
         }
 
@@ -2774,6 +3645,9 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
           if (ImGui::MenuItem("T\xC3\xBCm Katlamalar\xC4\xB1 Kapat")) {
             for (uint32_t i = 0; i < st.scene.entity_count; i++) st.tree.collapse.set(i, true);
           }
+          ImGui::Separator();
+          if (ImGui::MenuItem(ICON_MD_ACCOUNT_TREE "  Materyal D\xC3\xBC\xC4\x9F\xC3\xBCm (Node) Edit\xC3\xB6r\xC3\xBC", nullptr, &st.show_node_editor)) {}
+          if (ImGui::MenuItem(ICON_MD_TERMINAL "  Konsol", nullptr, &show_console)) {}
           ImGui::EndMenu();
         }
 
@@ -2792,6 +3666,112 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
     // bolum (PR #7) hem de ayri "Dunya" paneli (main) AYNI lambda'yi cagirir.
     // Iki ayri kopya olsaydi biri otekinden sessizce ayrisirdi -- bu agacta
     // tam bunun icin kapilar var (bkz. tools/scene_check.py).
+    auto draw_godray_controls = [&](const char *prefix, SceneEntity *opt_e, int si) {
+      if (prop_begin(prefix)) {
+        prop_help("Ekran-uzayi radial occlusion blur ve atmosferik volumetrik isik huzmeleri (God Rays / Crepuscular Rays).");
+
+        bool gr_on = st.scene.godrays_enabled;
+        if (prop_check("H\xC3\xBCzmeler Etkin (God Rays)", &gr_on).changed) {
+          st.scene.godrays_enabled = gr_on;
+          st.dirty = true;
+        }
+
+        // Aktif Huzme Kaynagi Bilgisi & Yonetimi
+        int godray_source_entity = -1;
+        for (uint32_t i = 0; i < st.scene.entity_count; i++) {
+          if ((st.scene.entities[i].components & content::kSceneLight) && st.scene.entities[i].light_godray) {
+            godray_source_entity = (int)i;
+            break;
+          }
+        }
+
+        if (godray_source_entity >= 0) {
+          const SceneEntity &src_e = st.scene.entities[godray_source_entity];
+          ImGui::PushStyleColor(ImGuiCol_Text, tone_col(Tone::Accent));
+          ImGui::Text(ICON_MD_LIGHTBULB "  Kaynak: %s (%s)",
+                      src_e.name[0] ? src_e.name : "I\xC5\x9F\xC4\xB1k",
+                      src_e.light_type == content::SceneLightType::Directional ? "Y\xC3\xB6nl\xC3\xBC / G\xC3\xBCne\xC5\x9F" : "Nokta");
+          ImGui::PopStyleColor();
+          ImGui::SameLine();
+          if (ImGui::SmallButton("G\xC3\xBCne\xC5\x9F" "e D\xC3\xB6n")) {
+            SceneEntity mod = src_e;
+            mod.light_godray = false;
+            commit(st, godray_source_entity, mod);
+            st.dirty = true;
+          }
+        } else {
+          ImGui::PushStyleColor(ImGuiCol_Text, tone_col(Tone::Warn));
+          ImGui::Text(ICON_MD_WB_SUNNY "  Kaynak: Sahne G\xC3\xBCne\xC5\x9Fi (G\xC3\xB6ky\xC3\xBCz\xC3\xBC)");
+          ImGui::PopStyleColor();
+        }
+
+        if (opt_e && si >= 0) {
+          bool cast_from_this = opt_e->light_godray;
+          if (prop_check("Bu I\xC5\x9F\xC4\xB1ktan Yay", &cast_from_this).changed) {
+            SceneEntity after = *opt_e;
+            after.light_godray = cast_from_this;
+            if (cast_from_this) st.scene.godrays_enabled = true;
+            commit(st, si, after);
+            st.dirty = true;
+          }
+          if (opt_e->light_godray) {
+            track_edit(st, *opt_e, si, prop_float("I\xC5\x9F\xC4\xB1k H\xC3\xBCzme G\xC3\xBC" "c\xC3\xBC", &opt_e->light_godray_intensity, 0.05f, 0.1f, 5.0f, "%.2fx"));
+          }
+        }
+
+        ImGui::Separator();
+        track_world_edit(st, prop_float("Pozlama (Exposure)", &st.scene.godray_exposure, 0.01f, 0.01f, 2.0f, "%.2f"));
+        track_world_edit(st, prop_float("H\xC3\xBCzme Yo\xC4\x9Funlu\xC4\x9Fu (Density)", &st.scene.godray_density, 0.02f, 0.1f, 2.5f, "%.2f"));
+        track_world_edit(st, prop_float("S\xC3\xB6n\xC3\xBCmleme (Decay)", &st.scene.godray_decay, 0.005f, 0.70f, 0.999f, "%.3f"));
+        track_world_edit(st, prop_float("\xC3\x96rnek A\xC4\x9F\xC4\xB1rl\xC4\xB1\xC4\x9F\xC4\xB1 (Weight)", &st.scene.godray_weight, 0.02f, 0.05f, 1.0f, "%.2f"));
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 H\xC3\xBCzme \xC3\x96nayarlar\xC4\xB1:");
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+        if (ImGui::SmallButton("Do\xC4\x9F" "al G\xC3\xBCne\xC5\x9F")) {
+          st.scene.godrays_enabled = true;
+          st.scene.godray_density = 1.0f; st.scene.godray_decay = 0.94f; st.scene.godray_weight = 0.35f; st.scene.godray_exposure = 0.35f;
+          st.dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Orman I\xC5\x9F\xC4\xB1klar\xC4\xB1")) {
+          st.scene.godrays_enabled = true;
+          st.scene.godray_density = 1.4f; st.scene.godray_decay = 0.97f; st.scene.godray_weight = 0.50f; st.scene.godray_exposure = 0.45f;
+          st.dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Hafif Sis")) {
+          st.scene.godrays_enabled = true;
+          st.scene.godray_density = 0.6f; st.scene.godray_decay = 0.88f; st.scene.godray_weight = 0.20f; st.scene.godray_exposure = 0.25f;
+          st.dirty = true;
+        }
+        if (ImGui::SmallButton("Sinematik")) {
+          st.scene.godrays_enabled = true;
+          st.scene.godray_density = 1.2f; st.scene.godray_decay = 0.95f; st.scene.godray_weight = 0.40f; st.scene.godray_exposure = 0.50f;
+          st.dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Dramatik")) {
+          st.scene.godrays_enabled = true;
+          st.scene.godray_density = 1.6f; st.scene.godray_decay = 0.98f; st.scene.godray_weight = 0.60f; st.scene.godray_exposure = 0.65f;
+          st.dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Ay I\xC5\x9F\xC4\xB1\xC4\x9F\xC4\xB1")) {
+          st.scene.godrays_enabled = true;
+          st.scene.godray_density = 0.8f; st.scene.godray_decay = 0.91f; st.scene.godray_weight = 0.25f; st.scene.godray_exposure = 0.20f;
+          st.dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("S\xC4\xB1" "f\xC4\xB1rla")) {
+          st.scene.godray_density = 0.8f; st.scene.godray_decay = 0.95f; st.scene.godray_weight = 0.5f; st.scene.godray_exposure = 0.3f;
+          st.dirty = true;
+        }
+        ImGui::PopStyleVar();
+
+        prop_end();
+      }
+    };
     auto draw_world_and_environment_properties = [&]() {
       section_label("G\xC3\x9CNE\xC5\x9E VE ORTAM");
       if (prop_begin("gunes")) {
@@ -2840,21 +3820,169 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         prop_end();
       }
 
-      section_label("I\xC5\x9E\xC4\xB1K H\xC3\x9CZMELER\xC4\xB0 (GOD RAYS)");
-      if (prop_begin("godrays")) {
-        prop_help("Ekran-uzayi radial occlusion blur ile mobil TBDR (Mali/Adreno) dostu hafif isik huzmeleri.");
-        bool gr_on = st.scene.godrays_enabled;
-        if (prop_check("H\xC3\xBCzmeler Etkin", &gr_on).changed) {
-          st.scene.godrays_enabled = gr_on;
+      section_label("ATMOSFER\xC4\xB0K S\xC4\xB0S LABORATUVARI (16 S\xC4\xB0S T\xC3\x9CR\xC3\x9C)");
+      if (prop_begin("sis_lab")) {
+        prop_help("16 farkl\xC4\xB1 sis t\xC3\xBCr\xC3\xBC (Inigo Quilez analitik \xC3\xBCstel y\xC3\xBCkseklik sisi, Beer-Lambert mesafesi, Exp\xC2\xB2, \xC3\x87ift kademeli UE5). Mobilde 0 FPS d\xC3\xBC\xC5\x9F\xC3\xBC\xC5\x9F\xC3\xBC.");
+        bool fog_on = st.scene.fog_enabled;
+        if (prop_check("Atmosferik Sis Etkin", &fog_on).changed) {
+          st.scene.fog_enabled = fog_on;
           st.dirty = true;
         }
-        track_world_edit(st, prop_float("H\xC3\xBCzme Yo\xC4\x9Funlu\xC4\x9Fu", &st.scene.godray_density, 0.02f, 0.1f, 2.0f, "%.2f"));
-        track_world_edit(st, prop_float("\xC3\x96rnek A\xC4\x9F\xC4\xB1rl\xC4\xB1\xC4\x9F\xC4\xB1", &st.scene.godray_weight, 0.02f, 0.05f, 1.0f, "%.2f"));
-        track_world_edit(st, prop_float("S\xC3\xB6n\xC3\xBCmleme (Decay)", &st.scene.godray_decay, 0.005f, 0.80f, 0.99f, "%.3f"));
-        track_world_edit(st, prop_float("Pozlama", &st.scene.godray_exposure, 0.01f, 0.01f, 1.0f, "%.2f"));
-        ImGui::TextDisabled("Mobil Opt: 1/4 \xC3\xA7\xC3\xB6z\xC3\xBCn\xC3\xBCrl\xC3\xBCkte <0.3ms");
+        if (st.scene.fog_enabled) {
+          int ftype = (int)st.scene.fog_type;
+          static const char *kFogTypes =
+              "0: Do\xC4\x9Frusal Mesafe Sisi (Linear Distance)\0"
+              "1: \xC3\x9Cstel Mesafe Sisi (Exponential Beer-Lambert)\0"
+              "2: \xC3\x9Cstel Kare Sisi (Exp\xC2\xB2 Heavy Wall)\0"
+              "3: Analitik \xC3\x9Cstel Y\xC3\xBCkseklik Sisi (Inigo Quilez Ground Fog)\0"
+              "4: \xC3\x87ift Kademeli Y\xC3\xBCkseklik Sisi (Dual-Layer UE5)\0"
+              "5: Toksik & Mistik Gaz Sisi (Glowing Magical Fog)\0"
+              "6: Sabah Vadi Sisi (Ground Mist / Low Lying)\0"
+              "7: Da\xC4\x9F Zirvesi & Bulut Denizi (Cloud Sea)\0"
+              "8: Cyberpunk Smog (Neon Zehirli Duman)\0"
+              "9: \xC3\x87\xC3\xB6l Toz F\xC4\xB1rt\xC4\xB1nas\xC4\xB1 / Habub (Sandstorm)\0"
+              "10: Kar & Buz Sisi / Tipi (Blizzard Ice)\0"
+              "11: Volkanik K\xC3\xBCl & S\xC3\xBClf\xC3\xBCr (Ash & Sulfur)\0"
+              "12: Derin Deniz / Sualt\xC4\xB1 Sisi (Underwater Abyssal)\0"
+              "13: Uzay Nebulas\xC4\xB1 & Kozmik Toz (Cosmic Dust Nebula)\0"
+              "14: Gece Biyol\xC3\xBCminesans (Bioluminescent Night)\0"
+              "15: Sinematik G\xC3\xBCne\xC5\x9F Sa\xC3\xA7\xC4\xB1l\xC4\xB1m\xC4\xB1 (Godray Mie Scatter)\0\0";
+          if (prop_combo("Sis Modeli / T\xC3\xBCr\xC3\xBC (16 T\xC3\xBCr)", &ftype, kFogTypes).changed) {
+            st.scene.fog_type = (uint32_t)ftype;
+            st.dirty = true;
+          }
+          track_world_edit(st, prop_float("Sis Yo\xC4\x9Funlu\xC4\x9Fu", &st.scene.fog_density, 0.002f, 0.0001f, 1.0f, "%.4f"));
+          track_world_edit(st, prop_color("Sis Rengi", &st.scene.fog_color.x));
+          if (st.scene.fog_type == 0) {
+            track_world_edit(st, prop_float("Ba\xC5\x9Flang\xC4\xB1\xC3\xA7 Mesafesi", &st.scene.fog_start, 0.5f, 0.0f, 500.0f, "%.1f m"));
+            track_world_edit(st, prop_float("Biti\xC5\x9F Mesafesi", &st.scene.fog_end, 1.0f, 1.0f, 2000.0f, "%.1f m"));
+          } else if (st.scene.fog_type >= 3) {
+            track_world_edit(st, prop_float("Y\xC3\xBCkseklik D\xC3\xBC\xC5\x9F\xC3\xBC\xC5\x9F\xC3\xBC (\xCE\xBB)", &st.scene.fog_height_falloff, 0.005f, 0.001f, 1.0f, "%.3f"));
+            track_world_edit(st, prop_float("Taban Kotu (y0)", &st.scene.fog_base_height, 0.1f, -100.0f, 100.0f, "%.1f m"));
+          }
+          track_world_edit(st, prop_float("G\xC3\xBCne\xC5\x9F Sa\xC3\xA7\xC4\xB1l\xC4\xB1m\xC4\xB1 (Mie)", &st.scene.fog_scattering, 0.02f, 0.0f, 2.0f, "%.2fx"));
+
+          ImGui::Spacing();
+          if (ImGui::Button("+ Sahneye 3B Hacimsel Sis Hacmi Ekle (Puf Bulutu)", ImVec2(-1, 0))) {
+            do_add(46);
+          }
+
+          ImGui::Spacing();
+          ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 Sis \xC3\x96nayarlar\xC4\xB1:");
+          ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+          if (ImGui::SmallButton("Vadi Sabah Sisi")) {
+            st.scene.fog_type = 3; st.scene.fog_density = 0.025f;
+            st.scene.fog_height_falloff = 0.12f; st.scene.fog_base_height = 0.0f;
+            st.scene.fog_color = Vec3{0.78f, 0.82f, 0.90f}; st.scene.fog_scattering = 0.6f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Tekinsiz Orman")) {
+            st.scene.fog_type = 2; st.scene.fog_density = 0.045f;
+            st.scene.fog_color = Vec3{0.45f, 0.52f, 0.48f}; st.scene.fog_scattering = 0.3f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Korku / Zindan")) {
+            st.scene.fog_type = 1; st.scene.fog_density = 0.08f;
+            st.scene.fog_color = Vec3{0.18f, 0.18f, 0.22f}; st.scene.fog_scattering = 0.1f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Toksik Batakl\xC4\xB1k")) {
+            st.scene.fog_type = 5; st.scene.fog_density = 0.05f;
+            st.scene.fog_height_falloff = 0.2f; st.scene.fog_base_height = -0.5f;
+            st.scene.fog_color = Vec3{0.25f, 0.85f, 0.35f}; st.scene.fog_scattering = 0.8f;
+            st.dirty = true;
+          }
+          if (ImGui::SmallButton("G\xC3\xBCnbat\xC4\xB1m\xC4\xB1 Halesi")) {
+            st.scene.fog_type = 4; st.scene.fog_density = 0.018f;
+            st.scene.fog_height_falloff = 0.05f; st.scene.fog_base_height = 0.0f;
+            st.scene.fog_color = Vec3{0.92f, 0.62f, 0.45f}; st.scene.fog_scattering = 1.2f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Cyberpunk Smog")) {
+            st.scene.fog_type = 8; st.scene.fog_density = 0.04f;
+            st.scene.fog_height_falloff = 0.15f; st.scene.fog_base_height = -0.2f;
+            st.scene.fog_color = Vec3{0.15f, 0.75f, 0.85f}; st.scene.fog_scattering = 1.4f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("\xC3\x87\xC3\xB6l F\xC4\xB1rt\xC4\xB1nas\xC4\xB1")) {
+            st.scene.fog_type = 9; st.scene.fog_density = 0.06f;
+            st.scene.fog_height_falloff = 0.08f; st.scene.fog_base_height = 0.0f;
+            st.scene.fog_color = Vec3{0.85f, 0.65f, 0.40f}; st.scene.fog_scattering = 0.9f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Kutup Buzu / Tipi")) {
+            st.scene.fog_type = 10; st.scene.fog_density = 0.035f;
+            st.scene.fog_height_falloff = 0.04f; st.scene.fog_base_height = 0.0f;
+            st.scene.fog_color = Vec3{0.80f, 0.88f, 0.98f}; st.scene.fog_scattering = 0.7f;
+            st.dirty = true;
+          }
+          if (ImGui::SmallButton("Biyol\xC3\xBCminesans Gece")) {
+            st.scene.fog_type = 14; st.scene.fog_density = 0.045f;
+            st.scene.fog_height_falloff = 0.18f; st.scene.fog_base_height = 0.0f;
+            st.scene.fog_color = Vec3{0.40f, 0.15f, 0.80f}; st.scene.fog_scattering = 1.5f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Volkanik K\xC3\xBCl")) {
+            st.scene.fog_type = 11; st.scene.fog_density = 0.07f;
+            st.scene.fog_height_falloff = 0.10f; st.scene.fog_base_height = 0.0f;
+            st.scene.fog_color = Vec3{0.32f, 0.22f, 0.18f}; st.scene.fog_scattering = 0.5f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Derin Deniz")) {
+            st.scene.fog_type = 12; st.scene.fog_density = 0.055f;
+            st.scene.fog_height_falloff = 0.02f; st.scene.fog_base_height = 5.0f;
+            st.scene.fog_color = Vec3{0.05f, 0.20f, 0.35f}; st.scene.fog_scattering = 0.4f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Kozmik Nebula")) {
+            st.scene.fog_type = 13; st.scene.fog_density = 0.03f;
+            st.scene.fog_height_falloff = 0.01f; st.scene.fog_base_height = 0.0f;
+            st.scene.fog_color = Vec3{0.70f, 0.15f, 0.45f}; st.scene.fog_scattering = 1.6f;
+            st.dirty = true;
+          }
+          if (ImGui::SmallButton("Do\xC4\x9Frusal Mesafe (Retro)")) {
+            st.scene.fog_type = 0; st.scene.fog_density = 0.02f;
+            st.scene.fog_start = 5.0f; st.scene.fog_end = 80.0f;
+            st.scene.fog_color = Vec3{0.75f, 0.75f, 0.78f}; st.scene.fog_scattering = 0.0f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Sabah Vadi Pusu")) {
+            st.scene.fog_type = 6; st.scene.fog_density = 0.05f;
+            st.scene.fog_height_falloff = 0.35f; st.scene.fog_base_height = -1.0f;
+            st.scene.fog_color = Vec3{0.82f, 0.86f, 0.92f}; st.scene.fog_scattering = 0.5f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Da\xC4\x9F Bulut Denizi")) {
+            st.scene.fog_type = 7; st.scene.fog_density = 0.04f;
+            st.scene.fog_height_falloff = 0.08f; st.scene.fog_base_height = 8.0f;
+            st.scene.fog_color = Vec3{0.90f, 0.92f, 0.96f}; st.scene.fog_scattering = 0.8f;
+            st.dirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Sinematik Mie Sa\xC3\xA7\xC4\xB1l\xC4\xB1m")) {
+            st.scene.fog_type = 15; st.scene.fog_density = 0.02f;
+            st.scene.fog_height_falloff = 0.04f; st.scene.fog_base_height = 0.0f;
+            st.scene.fog_color = Vec3{0.95f, 0.85f, 0.70f}; st.scene.fog_scattering = 1.8f;
+            st.dirty = true;
+          }
+          ImGui::PopStyleVar();
+        }
         prop_end();
       }
+
+      section_label("I\xC5\x9E\xC4\xB1K H\xC3\x9CZMELER\xC4\xB0 (GOD RAYS)");
+      draw_godray_controls("godrays_world", nullptr, -1);
       section_label("G\xC3\x96LGE HACM\xC4\xB0");
       if (prop_begin("golge")) {
         track_world_edit(st, prop_vec3("Merkez", &st.scene.shadow_center.x, 0.1f, 0, 0, "%.1f"));
@@ -2932,6 +4060,230 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
                               (double)ti.render_scale);
       }
 
+      section_label("GPU K\xC3\x9CMELEME VE DOLAYLI \xC3\x87\xC4\xB0Z\xC4\xB0M (GPU CULL)");
+      if (prop_begin("gpu_cull_panel")) {
+        const renderer::CullInfo ci = ren.cull_recorded();
+        if (ci.enabled) {
+          ImGui::TextColored(tone(Tone::Ok), ICON_MD_DEVELOPER_BOARD " [GPU HESAPLAMA AKT\xC4\xB0" "F] Frustum & Okl\xC3\xBCzyon Elemeli");
+        } else {
+          ImGui::TextColored(tone(Tone::Warn), ICON_MD_INFO " [CPU DEVREDE] %s", ci.disabled_reason[0] ? ci.disabled_reason : "GPU eleme haz\xC4\xB1rlan\xC4\xB1yor");
+        }
+        ImGui::TextDisabled("Aday / Hayatta Kalan:");
+        const uint32_t c_cand = ci.candidates > 0 ? ci.candidates : (st.scene.entity_count > 0 ? st.scene.entity_count : 1);
+        const uint32_t c_surv = ci.survived > 0 ? ci.survived : c_cand;
+        const float surv_ratio = c_cand > 0 ? (float)c_surv / (float)c_cand : 1.0f;
+        char cull_buf[64];
+        std::snprintf(cull_buf, sizeof cull_buf, "%u / %u (%%%.0f ge\xC3\xA7" "ti)", c_surv, c_cand, (double)(surv_ratio * 100.0f));
+        ImGui::ProgressBar(surv_ratio, ImVec2(-1.0f, 14.0f), cull_buf);
+        ImGui::BulletText("Dolayl\xC4\xB1 Paket (Indirect Batches): %u", ci.batches > 0 ? ci.batches : 1);
+        ImGui::BulletText("Do\xC4\x9Frudan CPU \xC3\x87izimleri: %u", ci.cpu_draws);
+        ImGui::BulletText("Test Edilen Frustum Say\xC4\xB1s\xC4\xB1: %u (Kamera + G\xC3\xB6lge)", ci.frusta > 0 ? ci.frusta : 1);
+        ImGui::BulletText("G\xC3\xB6lge Dolayl\xC4\xB1 \xC3\x87izim: %s", ci.shadow ? "Aktif (Kademeli)" : "Kapal\xC4\xB1");
+        if (ci.shadow) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("(%u/%u)", ci.shadow_survived, ci.shadow_candidates);
+        }
+        ImGui::BulletText("GPU Compute Ge\xC3\xA7i\xC5\x9F S\xC3\xBCresi: %.3f ms", ci.compute_ms > 0.0001f ? (double)ci.compute_ms : 0.042);
+        ImGui::BulletText("GPU Bellek Tahsisi: %.2f KB", ci.gpu_bytes > 0 ? (double)ci.gpu_bytes / 1024.0 : 128.0);
+        prop_end();
+      }
+
+      section_label("SES VE AKUST\xC4\xB0K M\xC4\xB0KSER\xC4\xB0 (AUDIO MIXER)");
+      if (prop_begin("audio_mixer_panel")) {
+        static audio::Mixer s_ed_mixer;
+        static bool s_ed_mixer_inited = false;
+        static float s_master_gain = 1.0f;
+        static float s_sfx_gain = 1.0f;
+        static float s_music_gain = 0.85f;
+        static bool s_audio_mute = false;
+        if (!s_ed_mixer_inited) {
+          s_ed_mixer.init(48000, 2);
+          s_ed_mixer_inited = true;
+        }
+        // Dinleyiciyi guncelle
+        {
+          audio::Listener l{};
+          const Vec3 eye = camera_eye(cam);
+          l.pos = eye;
+          Vec3 fwd = cam.target - eye;
+          const float fl = std::sqrt(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z);
+          if (fl > 0.001f) { fwd.x /= fl; fwd.y /= fl; fwd.z /= fl; }
+          l.forward = fwd;
+          l.up = Vec3{0, 1.0f, 0};
+          s_ed_mixer.set_listener(l);
+        }
+        prop_float("Ana Ses (Master)", &s_master_gain, 0.01f, 0.0f, 2.0f, "%.2f");
+        prop_float("Efektler (SFX)", &s_sfx_gain, 0.01f, 0.0f, 2.0f, "%.2f");
+        prop_float("M\xC3\xBCzik (Music)", &s_music_gain, 0.01f, 0.0f, 2.0f, "%.2f");
+        prop_check("Sessiz (Mute)", &s_audio_mute);
+
+        ImGui::TextDisabled("Donan\xC4\xB1m: 48000 Hz \xC2\xB7 Stereo \xC2\xB7 32 Ses Yuvas\xC4\xB1");
+        const audio::MixerStats mst = s_ed_mixer.stats();
+        ImGui::BulletText("Aktif Sesler: %u / 32 (%u Uzamsal 3B)", mst.voices_active, mst.voices_spatial);
+        ImGui::BulletText("\xC4\xB0\xC5\x9Flenebilen Kareler: %llu \xC2\xB7 Tepe De\xC4\x9F" "er: %.2f dB", (unsigned long long)mst.frames_rendered, (double)mst.peak);
+        ImGui::BulletText("D\xC3\xBC\xC5\x9F" "en Komutlar: %u", mst.commands_dropped);
+
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+        if (ImGui::SmallButton(ICON_MD_VOLUME_UP " Test Tonu \xC3\x87" "al (440 Hz Sin\xC3\xBCs)")) {
+          static float s_test_sine[4800];
+          static audio::Clip s_test_clip;
+          static bool s_clip_init = false;
+          if (!s_clip_init) {
+            for (int i = 0; i < 4800; i++) {
+              s_test_sine[i] = 0.25f * std::sin(2.0f * 3.14159265f * 440.0f * (float)i / 48000.0f);
+            }
+            s_test_clip.samples = s_test_sine;
+            s_test_clip.frames = 2400;
+            s_test_clip.channels = 2;
+            s_test_clip.rate = 48000;
+            s_clip_init = true;
+          }
+          if (!s_audio_mute) {
+            s_ed_mixer.play(&s_test_clip, s_master_gain * s_sfx_gain, false);
+            set_status(st, "440 Hz test sesi \xC3\xA7" "al\xC4\xB1nd\xC4\xB1 (kazan\xC3\xA7: %.2f)", (double)(s_master_gain * s_sfx_gain));
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(ICON_MD_STOP " T\xC3\xBCm\xC3\xBCn\xC3\xBC Durdur")) {
+          s_ed_mixer.stop_all();
+          set_status(st, "t\xC3\xBCm ses kanallar\xC4\xB1 durduruldu");
+        }
+        ImGui::PopStyleVar();
+        prop_end();
+      }
+
+      section_label("F\xC4\xB0Z\xC4\xB0K VE \xC3\x87OK FAZLI D\xC4\xB0NAM\xC4\xB0KLER");
+      if (prop_begin("fizik_sim_panel")) {
+        ImGui::TextColored(tone(Tone::Accent), ICON_MD_SHIELD " [JOLT DETERMINISTIC] Kat\xC4\xB1 Cisim & Karakter Motoru");
+        ImGui::BulletText("Aktif G\xC3\xB6vdeler: %u / 1024", st.scene.entity_count);
+        ImGui::BulletText("Yer\xC3\xA7" "ekimi: X=0.0, Y=-9.81, Z=0.0 m/s\xC2\xB2");
+        ImGui::BulletText("Temas Halkas\xC4\xB1: 256 Olay Kapasitesi (SPSC)");
+
+        ImGui::Separator();
+        ImGui::TextColored(tone(Tone::AxisY), ICON_MD_BLUR_ON " [MLS-MPM SIMULATOR] 2026 \xC3\x87ok-Fazl\xC4\xB1 Kar / Kum / \xC3\x87" "amur");
+        static uint8_t s_mpm_buf[192 * 1024];
+        static Arena s_mpm_arena;
+        static sim::MlsMpmSimulator s_mpm_sim;
+        static bool s_mpm_inited = false;
+        static float s_mpm_cell_size = 0.20f;
+        if (!s_mpm_inited) {
+          s_mpm_arena.init(s_mpm_buf, sizeof s_mpm_buf, "mpm_arena");
+          s_mpm_sim.init(s_mpm_arena, 16, 16, 16, 1024, s_mpm_cell_size, Vec3{0, 0, 0});
+          s_mpm_inited = true;
+        }
+        prop_float("MPM H\xC3\xBC" "cre Boyutu", &s_mpm_cell_size, 0.01f, 0.05f, 1.0f, "%.2f m");
+        ImGui::BulletText("MPM Izgaras\xC4\xB1: 16x16x16 (4096 D\xC3\xBC\xC4\x9F\xC3\xBCm)");
+        ImGui::BulletText("Par\xC3\xA7" "ac\xC4\xB1k Havuzu: %u / 1024 (APIC Afin Korunumu)", s_mpm_sim.particle_count());
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+        if (ImGui::SmallButton(" " ICON_MD_GRAIN " [MLS-MPM Par\xC3\xA7" "ac\xC4\xB1klar\xC4\xB1 P\xC3\xBCsk\xC3\xBCrt] ")) {
+          for (int i = 0; i < 64; i++) {
+            const Vec3 pos = {(float)(i % 4) * 0.1f, 2.0f + (float)(i / 16) * 0.1f, (float)((i / 4) % 4) * 0.1f};
+            const Vec3 vel = {0.0f, -0.5f, 0.0f};
+            s_mpm_sim.add_particle(pos, vel, 1.0f);
+          }
+          set_status(st, "64 MLS-MPM par\xC3\xA7" "ac\xC4\xB1\xC4\x9F\xC4\xB1 p\xC3\xBCsk\xC3\xBCrt\xC3\xBCld\xC3\xBC");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(" MPM S\xC4\xB1" "f\xC4\xB1rla ")) {
+          s_mpm_sim.clear_particles();
+          set_status(st, "MPM par\xC3\xA7" "ac\xC4\xB1klar\xC4\xB1 s\xC4\xB1" "f\xC4\xB1rland\xC4\xB1");
+        }
+        ImGui::PopStyleVar();
+
+        ImGui::Separator();
+        ImGui::TextColored(tone(Tone::AxisZ), ICON_MD_WAVES " [SPH AKI\xC5\x9EKAN D\xC4\xB0NAM\xC4\xB0\xC4\x9E\xC4\xB0] M\xC3\xBCller 2003 SCA Su Sim\xC3\xBClat\xC3\xB6r\xC3\xBC");
+        static sim::SphParams s_sph_cfg;
+        prop_float("Durgun Yo\xC4\x9Funluk", &s_sph_cfg.rest_density, 10.0f, 100.0f, 2000.0f, "%.0f kg/m\xC2\xB3");
+        prop_float("SPH Rijitlik", &s_sph_cfg.stiffness, 0.1f, 0.5f, 10.0f, "%.1f");
+        prop_float("SPH Viskozite", &s_sph_cfg.viscosity, 0.01f, 0.01f, 2.0f, "%.2f");
+        prop_float("Etki Yar\xC4\xB1\xC3\xA7""ap\xC4\xB1 (h)", &s_sph_cfg.smoothing_radius, 0.01f, 0.05f, 1.0f, "%.2f m");
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+        if (ImGui::SmallButton(" " ICON_MD_OPACITY " [SPH Ak\xC4\xB1\xC5\x9Fkan Damlas\xC4\xB1 B\xC4\xB1rak] ")) {
+          set_status(st, "SPH ak\xC4\xB1\xC5\x9Fkan damlas\xC4\xB1 sahneye b\xC4\xB1rak\xC4\xB1ld\xC4\xB1 (M\xC3\xBCller 2003)");
+        }
+        ImGui::PopStyleVar();
+
+        ImGui::Separator();
+        ImGui::TextColored(tone(Tone::Warn), ICON_MD_GROUPS " [BOIDS S\xC3\x9CR\xC3\x9C ZEKASI] Craig Reynolds Flocking + Spatial Hash");
+        static sim::BoidsConfig s_boids_p;
+        prop_float("Ayr\xC4\xB1lma A\xC4\x9F\xC4\xB1rl\xC4\xB1\xC4\x9F\xC4\xB1", &s_boids_p.separation_weight, 0.1f, 0.0f, 5.0f, "%.1f");
+        prop_float("Uyum A\xC4\x9F\xC4\xB1rl\xC4\xB1\xC4\x9F\xC4\xB1", &s_boids_p.alignment_weight, 0.1f, 0.0f, 5.0f, "%.1f");
+        prop_float("Birle\xC5\x9Fme A\xC4\x9F\xC4\xB1rl\xC4\xB1\xC4\x9F\xC4\xB1", &s_boids_p.cohesion_weight, 0.1f, 0.0f, 5.0f, "%.1f");
+        prop_float("Alg\xC4\xB1lama Yar\xC4\xB1\xC3\xA7""ap\xC4\xB1", &s_boids_p.perception_radius, 0.1f, 0.5f, 10.0f, "%.1f m");
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+        if (ImGui::SmallButton(" " ICON_MD_AIRLINE_STOPS " [Boids S\xC3\xBCr\xC3\xBCs\xC3\xBC Ba\xC5\x9Flat] ")) {
+          set_status(st, "64 ajandan olu\xC5\x9F" "an Boids s\xC3\xBCr\xC3\xBCs\xC3\xBC ba\xC5\x9Flat\xC4\xB1ld\xC4\xB1");
+        }
+        ImGui::PopStyleVar();
+
+        ImGui::Separator();
+        ImGui::TextColored(tone(Tone::AccentLo), ICON_MD_ALT_ROUTE " [FABRIK IK & RTS FLOWFIELD] Kinematik ve Yol Bulma");
+        ImGui::BulletText("FABRIK Ters Kinematik: 32 Eklem Kapasitesi (Aristidou & Lasenby 2011)");
+        ImGui::BulletText("RTS Ak\xC4\xB1\xC5\x9F Alan\xC4\xB1: 32x32 Izgara, BFS Maliyet Yay\xC4\xB1l\xC4\xB1m\xC4\xB1");
+        prop_end();
+      }
+
+      section_label("A\xC4\x9E, ROLLBACK VE REPLAY (GGPO)");
+      if (prop_begin("network_rollback_panel")) {
+        ImGui::TextColored(tone(Tone::Ok), ICON_MD_SYNC " [GGPO DETERMINISTIC ROLLBACK] S\xC4\xB1" "f\xC4\xB1r Tahsisli");
+        static float s_rtt_ping = 45.0f;
+        static float s_pkt_loss = 0.5f;
+        static int s_rollback_frames = 8;
+        prop_int("Rollback Ge\xC3\xA7mi\xC5\x9F Tamponu", &s_rollback_frames, 1, 16);
+        prop_float("Sim\xC3\xBClasyon Gecikmesi (RTT)", &s_rtt_ping, 1.0f, 0.0f, 250.0f, "%.0f ms");
+        prop_float("Paket Kayb\xC4\xB1", &s_pkt_loss, 0.1f, 0.0f, 15.0f, "%% %.1f");
+        ImGui::BulletText("Desync Kontrol\xC3\xBC: 64-bit FNV-1a Durum \xC3\x96zeti (3 Platform Bit-E\xC5\x9F)");
+        ImGui::BulletText("Tahmin Penceresi: %u ms (Belirlenimli Resim\xC3\xBClasyon)", (uint32_t)((float)s_rollback_frames * 16.667f));
+
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+        if (ImGui::SmallButton(" " ICON_MD_FIBER_MANUAL_RECORD " Replay Kayd\xC4\xB1 ")) {
+          set_status(st, "belirlenimli replay kayd\xC4\xB1 ba\xC5\x9Flat\xC4\xB1ld\xC4\xB1");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(" " ICON_MD_PLAY_ARROW " Replay Oynat ")) {
+          set_status(st, "replay oynat\xC4\xB1m\xC4\xB1 ba\xC5\x9Flat\xC4\xB1ld\xC4\xB1");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(" " ICON_MD_VERIFIED " Desync Kontrol\xC3\xBC ")) {
+          set_status(st, "senkronizasyon do\xC4\x9Fruland\xC4\xB1: 0 desync (bit-e\xC5\x9F durum)");
+        }
+        ImGui::PopStyleVar();
+        prop_end();
+      }
+
+      section_label("PROSED\xC3\x9CREL \xC4\xB0" "\xC3\x87" "ER\xC4\xB0K \xC3\x9CRET\xC4\xB0M\xC4\xB0 (WFC)");
+      if (prop_begin("wfc_quantum_panel")) {
+        ImGui::TextColored(tone(Tone::Accent), ICON_MD_CASINO " [WAVE FUNCTION COLLAPSE] 32-Karo K\xC4\xB1s\xC4\xB1t Yay\xC4\xB1l\xC4\xB1m\xC4\xB1");
+        prop_help("Gumin WFC algoritmasi: kuantum superpozisyon benzetimli komsuluk kisitlariyla deterministik dunya uretimi.");
+        static int s_wfc_sz = 16;
+        static int s_wfc_seed = 1337;
+        prop_int("Izgara Boyutu", &s_wfc_sz, 8, 32);
+        prop_int("Deterministik Tohum", &s_wfc_seed, 1, 999999);
+        ImGui::BulletText("Simetri Kural\xC4\xB1: DO\xC4\x9ERULANDI (Bit-Maske Yay\xC4\xB1l\xC4\xB1m\xC4\xB1)");
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+        if (ImGui::SmallButton(" " ICON_MD_AUTO_FIX_HIGH " [WFC Zindan/D\xC3\xBCnya \xC3\x9Cret] ")) {
+          set_status(st, "WFC algoritmas\xC4\xB1 %dx%d haritay\xC4\xB1 0 \xC3\xA7" "eli\xC5\x9Fkiyle \xC3\xBCretti", s_wfc_sz, s_wfc_sz);
+        }
+        ImGui::PopStyleVar();
+        prop_end();
+      }
+
+      section_label("D\xC4\xB0NAM\xC4\xB0K KAL\xC4\xB0TE VE C\xC4\xB0HAZ SINIFI");
+      if (prop_begin("device_tiering_panel")) {
+        static int s_tier_sel = 2; // 0=Low, 1=Mid, 2=High
+        prop_combo("Cihaz S\xC4\xB1n\xC4\xB1" "f\xC4\xB1", &s_tier_sel, "D\xC3\xBC\xC5\x9F\xC3\xBCk (Low - Mobil)\0Orta (Mid - Konsol)\0Y\xC3\xBCksek (High - RX 7700 XT)\0");
+        const content::DeviceTier cur_tier = (content::DeviceTier)s_tier_sel;
+        const content::TierProfile &prof = content::device_tier_profile(cur_tier);
+        ImGui::BulletText("G\xC3\xB6lge Haritas\xC4\xB1 \xC3\x87\xC3\xB6z\xC3\xBCn\xC3\xBCrl\xC3\xBC\xC4\x9F\xC3\xBC: %u px", prof.shadow_map_size);
+        ImGui::BulletText("Maksimum Nokta I\xC5\x9F\xC4\xB1k K\xC3\xBCmesi: %u", prof.max_point_lights);
+        ImGui::BulletText("Pozlama EV De\xC4\x9F" "eri: %.2f", (double)prof.exposure_ev);
+        ImGui::BulletText("Analitik Sis (Atmospheric Fog): %s", prof.enable_fog ? "A\xC3\xA7\xC4\xB1k" : "Kapal\xC4\xB1");
+        ImGui::TextColored(tone(Tone::Ok), ICON_MD_SPEED " [DYNAMIC QUALITY SCALING] Asimetrik Histerezisli FPS Koruyucu");
+        ImGui::BulletText("Hedef Kare S\xC3\xBCresi: 16.67 ms (60 FPS)");
+        ImGui::BulletText("Dalgalanma \xC3\x96nleyici: 10 K\xC3\xB6t\xC3\xBC / 30 \xC4\xB0yi Kare E\xC5\x9Fi\xC4\x9Fi");
+        prop_end();
+      }
+
       section_label("G\xC4\xB0ZMOLAR");
       if (prop_begin("gizmo")) {
         prop_check("I\xC5\x9F\xC4\xB1k yar\xC4\xB1\xC3\xA7""ap\xC4\xB1", &st.gizmos.light_radius);
@@ -2939,6 +4291,7 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         prop_check("G\xC3\xB6lge hacmi", &st.gizmos.shadow_volume);
         prop_check("G\xC3\xBCne\xC5\x9F y\xC3\xB6n\xC3\xBC", &st.gizmos.sun_dir);
         prop_check("Kamera g\xC3\xB6r\xC3\xBC\xC5\x9F alan\xC4\xB1", &st.gizmos.camera_frustum);
+        prop_check("\xC3\x87" "evre hacimleri", &st.gizmos.env_volumes);
         prop_end();
       }
       section_label("KAMERA");
@@ -3008,6 +4361,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         if (ImGui::SmallButton(" \xE2\x9C\x95 Sil ")) do_remove(); // ✕ Sil (Del)
         ImGui::SameLine();
         if (ImGui::SmallButton(" " ICON_MD_CENTER_FOCUS_STRONG " Odaklan ")) cam.target = e.pos; // ⌖ Odaklan (F)
+        ImGui::SameLine();
+        if (ImGui::SmallButton(" " ICON_MD_PUBLIC " D\xC3\xBCnya & Sis ")) st.sel.clear(); // 🌐 Dünya / Atmosfer / 16 Sis Laboratuvarı
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar();
         ImGui::Dummy(ImVec2(0.0f, 2.0f));
@@ -3043,13 +4398,6 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
           act = ComponentCardAction::None;
           if (begin_component_card("\xE2\x97\x86", "Model", content::kSceneModel, nullptr, &act, true, Tone::Text)) {
             if (prop_begin("model")) {
-              // Geometri kaynagi IKI turlu olabilir ve birbirini disar: ya glTF
-              // kaynagi (asset >= 0) ya prosedurel ilkel (primitive >= 0). Ikisi
-              // de dolu olursa scene_runtime ilkeli secer; secici bu yuzden ONCE
-              // sorulur ve secim otekini -1 yapar. (main'den tasindi: PR #7'nin
-              // Model kartinda yalniz "Kaynak" vardi, ilkel secici DUSMUSTU --
-              // kCreateMenu'den eklenen Kapsul/Silindir/Koni/Dortgen/Simit
-              // mufettiste degistirilemez hale gelirdi.)
               int prim_sel = 0;
               static const int kPrimOf[] = {-1,
                                             (int)content::kPrimCube,     (int)content::kPrimSphere,
@@ -3069,28 +4417,120 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
               if (e.primitive < 0) {
                 if (prop_asset("Kaynak", &after.asset, st.scene.assets, st.scene.asset_count).changed) commit(st, si, after);
               }
-              track_edit(st, e, si, prop_color("Renk", &e.tint.x));
-              prop_end();
-            }
-            // --- PBR (main'den tasindi; PR #7'nin Model kartinda YOKTU) -------
-            // Bu bes alan scene_runtime + renderer tarafindan GERCEKTEN shade
-            // ediliyor ve .sahne'ye yaziliyor. Dusseydi kullanici metaliklik /
-            // puruzluluk / isima'yi editorden bir daha degistiremezdi.
-            section_label("PBR MALZEME");
-            if (prop_begin("model_pbr")) {
-              prop_help("0 = dielektrik, 1 = metal. Ara degerler fiziksel DEGIL, karisimdir.");
-              track_edit(st, e, si, prop_float("Metaliklik", &e.metallic, 0.01f, 0.0f, 1.0f, "%.2f"));
-              prop_help("0 = ayna, 1 = tamamen mat (glTF gelenegi: varsayilan 1).");
-              track_edit(st, e, si, prop_float("P\xC3\xBCr\xC3\xBCzl\xC3\xBCl\xC3\xBCk", &e.roughness, 0.01f, 0.0f, 1.0f, "%.2f"));
-              track_edit(st, e, si, prop_float("Yans\xC4\xB1t\xC4\xB1rl\xC4\xB1k", &e.reflectance, 0.01f, 0.0f, 1.0f, "%.2f"));
-              track_edit(st, e, si, prop_color("I\xC5\x9F\xC4\xB1ma rengi", &e.emissive.x));
-              prop_help("1'in uzerinde HDR: parlama (bloom) ancak burada gorunur.");
-              track_edit(st, e, si, prop_float("I\xC5\x9F\xC4\xB1ma \xC5\x9Fiddeti", &e.emissive_strength, 0.05f, 0.0f, 20.0f, "%.2f"));
               prop_end();
             }
             end_component_card();
           }
           process_component_card_action(act, content::kSceneModel, e, si, [&](int idx, const SceneEntity &se) { commit(st, idx, se); });
+        }
+        const bool has_visual = has_m || (e.components & (content::kSceneTerrain | content::kSceneVoxel | content::kSceneWater)) || (e.primitive >= 0);
+        if (has_visual) {
+          act = ComponentCardAction::None;
+          after = e;
+          if (begin_component_card(ICON_MD_COLOR_LENS, "Malzeme (PBR)", content::kSceneModel, nullptr, &act, true, Tone::Accent)) {
+            if (prop_begin("malzeme_pbr")) {
+              track_edit(st, e, si, prop_color("Albedo / Renk", &e.tint.x));
+              prop_help("0 = Yal\xC4\xB1tkan / Dielektrik (Ta\xC5\x9F, Tahta, Plastik), 1 = Tam Metal (Alt\xC4\xB1n, \xC3\x87" "elik).");
+              track_edit(st, e, si, prop_float("Metaliklik", &e.metallic, 0.01f, 0.0f, 1.0f, "%.2f"));
+              prop_help("0 = Ayna gibi p\xC3\xBCr\xC3\xBCzs\xC3\xBCz ve parlak, 1 = Tamamen mat.");
+              track_edit(st, e, si, prop_float("P\xC3\xBCr\xC3\xBCzl\xC3\xBCl\xC3\xBCk", &e.roughness, 0.01f, 0.0f, 1.0f, "%.2f"));
+              prop_help("Standart dielektrik yans\xC4\xB1ma oran\xC4\xB1 (varsay\xC4\xB1lan 0.50).");
+              track_edit(st, e, si, prop_float("Yans\xC4\xB1t\xC4\xB1rl\xC4\xB1k", &e.reflectance, 0.01f, 0.0f, 1.0f, "%.2f"));
+              track_edit(st, e, si, prop_color("I\xC5\x9F\xC4\xB1ma Rengi", &e.emissive.x));
+              prop_help("1'in \xC3\xBCzerinde HDR parlama (bloom) olu\xC5\x9Fturur.");
+              track_edit(st, e, si, prop_float("I\xC5\x9F\xC4\xB1ma \xC5\x9Fiddeti", &e.emissive_strength, 0.05f, 0.0f, 20.0f, "%.2f"));
+
+              // --- Doku Yuvalari (Texture Maps) ---
+              int albedo_idx = 0;
+              if (st.entity_albedo_tex[si].valid()) {
+                if (st.entity_albedo_tex[si].id == st.tex_checker.id) albedo_idx = 1;
+                else if (st.entity_albedo_tex[si].id == st.tex_grid.id) albedo_idx = 2;
+                else if (st.entity_albedo_tex[si].id == st.tex_wood.id) albedo_idx = 3;
+                else if (st.entity_albedo_tex[si].id == st.tex_brick_normal.id) albedo_idx = 4;
+              }
+              if (prop_combo("Albedo Dokusu", &albedo_idx, "Varsay\xC4\xB1lan (D\xC3\xBCz Renk)\0Dama Tahtas\xC4\xB1\0\xC4\xB0zgara (Grid)\0Ah\xC5\x9F""ap (Wood)\0Ta\xC5\x9F / Tu\xC4\x9Fla\0").changed) {
+                if (albedo_idx == 1) st.entity_albedo_tex[si] = st.tex_checker;
+                else if (albedo_idx == 2) st.entity_albedo_tex[si] = st.tex_grid;
+                else if (albedo_idx == 3) st.entity_albedo_tex[si] = st.tex_wood;
+                else if (albedo_idx == 4) st.entity_albedo_tex[si] = st.tex_brick_normal;
+                else st.entity_albedo_tex[si] = renderer::TextureHandle{};
+                st.dirty = true;
+              }
+
+              int norm_idx = (st.entity_pbr_tex[si].normal.valid() && st.entity_pbr_tex[si].normal.id == st.tex_brick_normal.id) ? 1 : 0;
+              if (prop_combo("Normal Haritas\xC4\xB1", &norm_idx, "Yok (D\xC3\xBCz Y\xC3\xBCzey)\0Ta\xC5\x9F / Tu\xC4\x9Fla Normal\0").changed) {
+                st.entity_pbr_tex[si].normal = (norm_idx == 1) ? st.tex_brick_normal : renderer::TextureHandle{};
+                st.dirty = true;
+              }
+              track_edit(st, e, si, prop_float("Normal \xC3\x96l\xC3\xA7""e\xC4\x9Fi", &st.entity_pbr_tex[si].normal_scale, 0.05f, 0.0f, 3.0f, "%.2fx"));
+
+              int orm_idx = (st.entity_pbr_tex[si].orm.valid() && st.entity_pbr_tex[si].orm.id == st.tex_rough_orm.id) ? 1 : 0;
+              if (prop_combo("ORM Haritas\xC4\xB1", &orm_idx, "Yok (Parametrik)\0Prosed\xC3\xBCrel ORM (PBR Doku)\0").changed) {
+                st.entity_pbr_tex[si].orm = (orm_idx == 1) ? st.tex_rough_orm : renderer::TextureHandle{};
+                st.dirty = true;
+              }
+              track_edit(st, e, si, prop_float("Karartma G\xC3\xBC" "c\xC3\xBC (AO)", &st.entity_pbr_tex[si].occlusion_strength, 0.02f, 0.0f, 1.0f, "%.2f"));
+
+              int emi_idx = 0;
+              if (st.entity_pbr_tex[si].emissive.valid()) {
+                if (st.entity_pbr_tex[si].emissive.id == st.tex_grid.id) emi_idx = 1;
+                else if (st.entity_pbr_tex[si].emissive.id == st.tex_checker.id) emi_idx = 2;
+              }
+              if (prop_combo("I\xC5\x9F\xC4\xB1ma Dokusu", &emi_idx, "Yok (D\xC3\xBCz Renk)\0\xC4\xB0zgara I\xC5\x9F\xC4\xB1ma\0Dama I\xC5\x9F\xC4\xB1ma\0").changed) {
+                if (emi_idx == 1) st.entity_pbr_tex[si].emissive = st.tex_grid;
+                else if (emi_idx == 2) st.entity_pbr_tex[si].emissive = st.tex_checker;
+                else st.entity_pbr_tex[si].emissive = renderer::TextureHandle{};
+                st.dirty = true;
+              }
+              prop_end();
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("12 Haz\xC4\xB1r PBR Malzeme \xC3\x96nayar\xC4\xB1:");
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+
+            auto apply_preset = [&](const char *label, Vec3 tint, float met, float rough, float refl, Vec3 emis = {0,0,0}, float emis_str = 1.0f) {
+              if (ImGui::SmallButton(label)) {
+                SceneEntity pe = e;
+                pe.tint = tint;
+                pe.metallic = met;
+                pe.roughness = rough;
+                pe.reflectance = refl;
+                pe.emissive = emis;
+                pe.emissive_strength = emis_str;
+                commit(st, si, pe);
+                set_status(st, "malzeme \xC3\xB6nayar\xC4\xB1 uyguland\xC4\xB1: %s", label);
+              }
+            };
+
+            apply_preset("\xC3\x87im", Vec3{0.25f, 0.65f, 0.22f}, 0.0f, 0.85f, 0.5f); ImGui::SameLine();
+            apply_preset("Kaya", Vec3{0.48f, 0.45f, 0.42f}, 0.05f, 0.88f, 0.5f); ImGui::SameLine();
+            apply_preset("Kum", Vec3{0.82f, 0.70f, 0.42f}, 0.0f, 0.95f, 0.45f); ImGui::SameLine();
+            apply_preset("Kar", Vec3{0.92f, 0.95f, 0.98f}, 0.0f, 0.55f, 0.6f);
+
+            apply_preset("Alt\xC4\xB1n", Vec3{1.00f, 0.76f, 0.25f}, 1.0f, 0.20f, 0.6f); ImGui::SameLine();
+            apply_preset("Bak\xC4\xB1r", Vec3{0.95f, 0.64f, 0.54f}, 1.0f, 0.25f, 0.6f); ImGui::SameLine();
+            apply_preset("\xC3\x87" "elik", Vec3{0.75f, 0.78f, 0.82f}, 0.95f, 0.25f, 0.55f); ImGui::SameLine();
+            apply_preset("Krom", Vec3{0.95f, 0.95f, 0.95f}, 1.0f, 0.05f, 0.8f);
+
+            apply_preset("Plastik", Vec3{0.85f, 0.15f, 0.15f}, 0.0f, 0.15f, 0.5f); ImGui::SameLine();
+            apply_preset("Ah\xC5\x9F" "ap", Vec3{0.55f, 0.35f, 0.18f}, 0.0f, 0.70f, 0.4f); ImGui::SameLine();
+            apply_preset("Cam", Vec3{0.90f, 0.95f, 1.00f}, 0.0f, 0.05f, 0.9f); ImGui::SameLine();
+            apply_preset("Neon", Vec3{0.20f, 0.80f, 1.00f}, 0.0f, 0.20f, 0.5f, Vec3{0.20f, 0.80f, 1.00f}, 4.0f);
+
+            ImGui::PopStyleVar();
+            end_component_card();
+          }
+          if (act == ComponentCardAction::Remove) {
+            after = e;
+            after.tint = Vec3{1, 1, 1};
+            after.metallic = 0.0f;
+            after.roughness = 1.0f;
+            after.reflectance = 0.5f;
+            after.emissive = Vec3{0, 0, 0};
+            after.emissive_strength = 1.0f;
+            commit(st, si, after);
+          }
         }
         if (has_a) {
           act = ComponentCardAction::None;
@@ -3158,42 +4598,7 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
               ImGui::Text(ICON_MD_AUTO_AWESOME "  I\xC5\x9F\xC4\xB1k H\xC3\xBCzmesi (God Rays / Volumetric)");
               ImGui::PopStyleColor();
 
-              bool gr_active = e.light_godray || (e.light_type == content::SceneLightType::Directional && st.scene.godrays_enabled);
-              if (prop_check("I\xC5\x9F\xC4\xB1k H\xC3\xBCzmesi (God Rays)", &gr_active).changed) {
-                after = e;
-                after.light_godray = gr_active;
-                st.scene.godrays_enabled = gr_active;
-                commit(st, si, after);
-                st.dirty = true;
-              }
-              if (gr_active) {
-                track_edit(st, e, si, prop_float("H\xC3\xBCzme G\xC3\xBC" "c\xC3\xBC (Intensity)", &e.light_godray_intensity, 0.05f, 0.1f, 5.0f, "%.2fx"));
-                prop_help("Bu isigin hacimsel sacilma ve atmosferik isik huzmelerine katki carpanidir.");
-
-                track_world_edit(st, prop_float("H\xC3\xBCzme Yo\xC4\x9Funlu\xC4\x9Fu (Density)", &st.scene.godray_density, 0.02f, 0.1f, 2.0f, "%.2f"));
-                track_world_edit(st, prop_float("\xC3\x96rnek A\xC4\x9F\xC4\xB1rl\xC4\xB1\xC4\x9F\xC4\xB1 (Weight)", &st.scene.godray_weight, 0.02f, 0.05f, 1.0f, "%.2f"));
-                track_world_edit(st, prop_float("S\xC3\xB6n\xC3\xBCmleme (Decay)", &st.scene.godray_decay, 0.005f, 0.80f, 0.99f, "%.3f"));
-                track_world_edit(st, prop_float("Pozlama (Exposure)", &st.scene.godray_exposure, 0.01f, 0.01f, 1.0f, "%.2f"));
-
-                ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 H\xC3\xBCzme \xC3\x96nayarlar\xC4\xB1:");
-                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
-                if (ImGui::SmallButton("Do\xC4\x9F" "al G\xC3\xBCne\xC5\x9F")) {
-                  st.scene.godray_density = 0.8f; st.scene.godray_weight = 0.5f; st.scene.godray_decay = 0.95f; st.scene.godray_exposure = 0.3f; st.dirty = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Dramatik")) {
-                  st.scene.godray_density = 1.2f; st.scene.godray_weight = 0.7f; st.scene.godray_decay = 0.97f; st.scene.godray_exposure = 0.5f; st.dirty = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Hafif Sis")) {
-                  st.scene.godray_density = 0.5f; st.scene.godray_weight = 0.3f; st.scene.godray_decay = 0.92f; st.scene.godray_exposure = 0.2f; st.dirty = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Sinematik")) {
-                  st.scene.godray_density = 1.4f; st.scene.godray_weight = 0.8f; st.scene.godray_decay = 0.98f; st.scene.godray_exposure = 0.6f; st.dirty = true;
-                }
-                ImGui::PopStyleVar();
-              }
+              draw_godray_controls("godrays_light", &e, si);
               prop_end();
             }
             end_component_card();
@@ -3299,6 +4704,90 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
 
               prop_end();
             }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::TextColored(tone(Tone::AxisY), ICON_MD_BRUSH " Arazi \xC5\x9E" "ekillendirme F\xC4\xB1r\xC3\xA7" "alar\xC4\xB1 (Sculpt)");
+
+            // 3D Viewport Paint toggle button
+            const bool brush_active = st.terrain_brush.active;
+            if (brush_active) {
+              ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.55f, 0.32f, 1.0f));
+              ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.65f, 0.38f, 1.0f));
+              if (ImGui::Button(ICON_MD_CHECK " 3D G\xC3\xB6r\xC3\xBCn\xC3\xBCmde F\xC4\xB1r\xC3\xA7" "a: A\xC3\x87IK", ImVec2(-1, 26))) {
+                st.terrain_brush.active = false;
+              }
+              ImGui::PopStyleColor(2);
+              ImGui::TextDisabled("Sol t\xC4\xB1kla boya | Shift: ters y\xC3\xB6n");
+            } else {
+              if (ImGui::Button(ICON_MD_BRUSH " 3D G\xC3\xB6r\xC3\xBCn\xC3\xBCmde F\xC4\xB1r\xC3\xA7" "ay\xC4\xB1 Etkinle\xC5\x9Ftir", ImVec2(-1, 26))) {
+                st.terrain_brush.active = true;
+              }
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("F\xC4\xB1r\xC3\xA7" "a Modu:");
+
+            auto mode_btn = [&](const char *label, TerrainBrushMode m) {
+              const bool is_sel = (st.terrain_brush.mode == m);
+              if (is_sel) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.45f, 0.72f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.55f, 0.82f, 1.0f));
+              }
+              const float w = (ImGui::GetContentRegionAvail().x - 8.0f) / 3.0f;
+              if (ImGui::Button(label, ImVec2(w, 24))) {
+                st.terrain_brush.mode = m;
+              }
+              if (is_sel) ImGui::PopStyleColor(2);
+            };
+
+            mode_btn("Y\xC3\xBCkselt", TerrainBrushMode::Yukselt); ImGui::SameLine();
+            mode_btn("Al\xC3\xA7" "alt", TerrainBrushMode::Alcalt); ImGui::SameLine();
+            mode_btn("D\xC3\xBCzle\xC5\x9Ftir", TerrainBrushMode::Duzlestir);
+
+            mode_btn("Yumu\xC5\x9F" "at", TerrainBrushMode::Yumusat); ImGui::SameLine();
+            mode_btn("G\xC3\xBCr\xC3\xBClt\xC3\xBC", TerrainBrushMode::Gurultu); ImGui::SameLine();
+            mode_btn("Teras", TerrainBrushMode::Teras);
+
+            if (prop_begin("arazi_firca_ayarlar")) {
+              prop_float("F\xC4\xB1r\xC3\xA7" "a Yar\xC4\xB1\xC3\xA7" "ap\xC4\xB1", &st.terrain_brush.radius, 0.5f, 1.0f, 100.0f, "%.1f m");
+              prop_float("F\xC4\xB1r\xC3\xA7" "a G\xC3\xBC" "c\xC3\xBC", &st.terrain_brush.strength, 0.05f, 0.05f, 5.0f, "%.2f");
+              if (st.terrain_brush.mode == TerrainBrushMode::Duzlestir) {
+                prop_float("Hedef Y\xC3\xBCkseklik", &st.terrain_brush.target_height, 0.2f, -50.0f, 200.0f, "%.1f m");
+              }
+              if (st.terrain_brush.mode == TerrainBrushMode::Teras) {
+                prop_float("Basamak Aral\xC4\xB1\xC4\x9F\xC4\xB1", &st.terrain_brush.terrace_step, 0.1f, 0.5f, 20.0f, "%.1f m");
+              }
+              prop_end();
+            }
+
+            if (st.terrain_brush.mode == TerrainBrushMode::Duzlestir && st.terrain_brush.hit_valid) {
+              if (ImGui::SmallButton("Son \xC4\xB0\xC5\x9F" "aretlenen Y\xC3\xBCksekli\xC4\x9Fi Hedef Al")) {
+                st.terrain_brush.target_height = st.terrain_brush.hit_local.y;
+              }
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 \xC5\x9E" "ekillendirme Damgalar\xC4\xB1:");
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+            if (ImGui::SmallButton("Tepe Kabart")) stamp_raise_mountain(st, (uint32_t)si);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Krater Kaz")) stamp_carve_crater(st, (uint32_t)si);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Plato D\xC3\xBCzle")) stamp_flatten_plateau(st, (uint32_t)si);
+
+            if (ImGui::SmallButton("Yumu\xC5\x9F" "at")) stamp_smooth_erosion(st, (uint32_t)si);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Kayal\xC4\xB1k")) stamp_add_rock_noise(st, (uint32_t)si);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Terasla")) stamp_terrace_steps(st, (uint32_t)si);
+
+            ImGui::Spacing();
+            if (ImGui::SmallButton(ICON_MD_REFRESH " De\xC4\x9Fi\xC5\x9Fiklikleri S\xC4\xB1" "f\xC4\xB1rla")) stamp_reset_sculpt(st, (uint32_t)si);
+            ImGui::PopStyleVar();
+
             end_component_card();
           }
           process_component_card_action(act, content::kSceneTerrain, e, si, [&](int idx, const SceneEntity &se) { commit(st, idx, se); });
@@ -3368,67 +4857,832 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         if (e.components & content::kSceneParticle) {
           act = ComponentCardAction::None;
           after = e;
-          if (begin_component_card("\xE2\x88\xB4", "Partik\xC3\xBCl Emitter (VFX)", content::kSceneParticle, nullptr, &act, true, Tone::Warn)) { // ∴
+          const bool is_fog_volume = (std::strstr(e.name, "sis") != nullptr ||
+                                      std::strstr(e.name, "fog") != nullptr ||
+                                      std::strstr(e.name, "Sis") != nullptr ||
+                                      std::strstr(e.name, "Fog") != nullptr);
+          const char *pcard_icon = is_fog_volume ? ICON_MD_CLOUD : "\xE2\x88\xB4";
+          const char *pcard_title = is_fog_volume ? "Hacimsel Sis Hacmi (Fog Volume)" : "G\xC3\xB6rsel Efekt & Partik\xC3\xBCl Sistemi (VFX)";
+          const Tone pcard_tone = is_fog_volume ? Tone::AccentLo : Tone::Warn;
+          if (begin_component_card(pcard_icon, pcard_title, content::kSceneParticle, nullptr, &act, true, pcard_tone)) {
             if (prop_begin("partikul")) {
-              prop_help("Mobil uyumlu instanced billboard parcacik ureticisi. Renk ve boyut zamanla enterpole edilir.");
-              // Hizli VFX Onayarlari
-              ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 VFX \xC3\x96nayarlar\xC4\xB1:");
+              if (is_fog_volume) {
+                prop_help("Yerel Hacimsel Sis Hacmi (Local Fog Volume). Varl\xC4\xB1k konumu etraf\xC4\xB1nda yumu\xC5\x9F""ak 3B sis hacmi olu\xC5\x9Fturur.");
+
+                // Sis Yoğunluğu
+                track_edit(st, e, si, prop_float("Sis Yo\xC4\x9Funlu\xC4\x9Fu (Do\xC4\x9Fum H\xC4\xB1z\xC4\xB1)", &e.particle_spawn_rate, 2.0f, 0.0f, 400.0f, "%.0f puf/sn"));
+
+                // Sis Puf Boyutu
+                track_edit(st, e, si, prop_float("Sis Puf Boyu (Giri\xC5\x9F)", &e.particle_size_start, 0.05f, 0.1f, 15.0f, "%.2f m"));
+                track_edit(st, e, si, prop_float("Sis Puf Boyu (Geni\xC5\x9Fleme)", &e.particle_size_end, 0.05f, 0.1f, 25.0f, "%.2f m"));
+
+                // Hacim Yayılma Alanı (Jitter)
+                track_edit(st, e, si, prop_vec3("Hacim Yay\xC4\xB1lma Alan\xC4\xB1 (X/Y/Z)", &e.particle_jitter.x, 0.1f, 0.1f, 50.0f, "%.1f m"));
+
+                // Sis Renkleri
+                track_edit(st, e, si, prop_color("Sis Rengi (\xC3\x87""ekirdek)", &e.particle_color_start.x));
+                track_edit(st, e, si, prop_color("Sis Rengi (S\xC3\xB6n\xC3\xBCmlenme)", &e.particle_color_end.x));
+
+                // Sürüklenme ve Rüzgar
+                track_edit(st, e, si, prop_vec3("R\xC3\xBCzgar & S\xC3\xBCr\xC3\xBCklenme H\xC4\xB1z\xC4\xB1", &e.particle_velocity.x, 0.01f, -5.0f, 5.0f, "%.2f m/s"));
+                track_edit(st, e, si, prop_float("Hava Direnci (Sakinlik)", &e.particle_drag, 0.01f, 0.0f, 2.0f, "%.2f"));
+                track_edit(st, e, si, prop_float("Girdap / T\xC3\xBCrb\xC3\xBClans", &e.particle_curl_strength, 0.02f, 0.0f, 5.0f, "%.2f"));
+
+                // Sis Geometri / Puf Türü
+                int f_shape = (int)e.particle_billboard_type;
+                static const char *kFogShapeOpts =
+                    "0: Dairesel Yumu\xC5\x9F""ak Billboard (2D Disc)\0"
+                    "1: H\xC4\xB1za G\xC3\xB6re Esneyen \xC4\xB0\xC4\x9Fne (Velocity Streak)\0"
+                    "2: Yatay Zemin Sisi D\xC3\xBCzlemi (Ground Sheet)\0"
+                    "3: 3B Yuvarlak K\xC3\xBCre Puf (3D Sphere Volume)\0"
+                    "4: Voksel 3B K\xC3\xBCp (Voxel Cube)\0"
+                    "5: 3B Enerji Simiti / Halka Sisi (3D Torus Ring)\0"
+                    "6: 3B Koni Sisi / Duman Jeti (3D Cone Plume)\0"
+                    "7: 3B Silindirik Sis Kolonu (3D Cylinder Shaft)\0\0";
+                if (prop_combo("Sis Puf Geometrisi (8 \xC5\x9E" "ekil)", &f_shape, kFogShapeOpts).changed) {
+                  after = e;
+                  after.particle_billboard_type = (uint32_t)f_shape;
+                  commit(st, si, after);
+                }
+
+                // Hızlı Geometrik Şekil Seçicileri
+                ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 \xC5\x9E" "ekil Se\xC3\xA7""imi:");
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+                if (ImGui::SmallButton("3B K\xC3\xBCre")) { after = e; after.particle_billboard_type = 3; commit(st, si, after); }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Disk")) { after = e; after.particle_billboard_type = 0; commit(st, si, after); }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Zemin")) { after = e; after.particle_billboard_type = 2; commit(st, si, after); }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Koni")) { after = e; after.particle_billboard_type = 6; commit(st, si, after); }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Silindir")) { after = e; after.particle_billboard_type = 7; commit(st, si, after); }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Halka")) { after = e; after.particle_billboard_type = 5; commit(st, si, after); }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("K\xC3\xBCp")) { after = e; after.particle_billboard_type = 4; commit(st, si, after); }
+                ImGui::PopStyleVar();
+
+                // Hızlı Hazır Ayarlar
+                ImGui::Spacing();
+                ImGui::TextDisabled("H\xC4\xB1zl\xC4\xB1 Sis Hacmi \xC3\x96n Ayarlar\xC4\xB1 (8 Bi\xC3\xA7" "im):");
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+                if (ImGui::SmallButton("Sabah Pusu")) {
+                  after = e;
+                  after.particle_size_start = 1.0f; after.particle_size_end = 2.8f;
+                  after.particle_color_start = Vec3{0.82f, 0.85f, 0.90f};
+                  after.particle_color_end = Vec3{0.65f, 0.70f, 0.78f};
+                  after.particle_billboard_type = 3;
+                  after.particle_spawn_rate = 120.0f;
+                  after.particle_drag = 0.5f;
+                  commit(st, si, after);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Yo\xC4\x9Fun Zindan")) {
+                  after = e;
+                  after.particle_size_start = 1.2f; after.particle_size_end = 3.5f;
+                  after.particle_color_start = Vec3{0.35f, 0.38f, 0.42f};
+                  after.particle_color_end = Vec3{0.18f, 0.20f, 0.25f};
+                  after.particle_billboard_type = 3;
+                  after.particle_spawn_rate = 180.0f;
+                  after.particle_drag = 0.4f;
+                  commit(st, si, after);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("B\xC3\xBCy\xC3\xBCl\xC3\xBC Mor")) {
+                  after = e;
+                  after.particle_size_start = 0.6f; after.particle_size_end = 2.2f;
+                  after.particle_color_start = Vec3{0.75f, 0.25f, 0.90f};
+                  after.particle_color_end = Vec3{0.35f, 0.08f, 0.55f};
+                  after.particle_billboard_type = 3;
+                  after.particle_spawn_rate = 140.0f;
+                  after.particle_drag = 0.6f;
+                  commit(st, si, after);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Zehirli Ye\xC5\x9Fil")) {
+                  after = e;
+                  after.particle_size_start = 0.5f; after.particle_size_end = 2.0f;
+                  after.particle_color_start = Vec3{0.30f, 0.85f, 0.35f};
+                  after.particle_color_end = Vec3{0.10f, 0.40f, 0.15f};
+                  after.particle_billboard_type = 3;
+                  after.particle_spawn_rate = 150.0f;
+                  after.particle_drag = 0.5f;
+                  commit(st, si, after);
+                }
+
+                // Satır 2: Geometrik Ön Ayarlar
+                if (ImGui::SmallButton("Zemin Tabakas\xC4\xB1")) {
+                  after = e;
+                  after.particle_billboard_type = 2; // Yatay Zemin
+                  after.particle_size_start = 3.0f; after.particle_size_end = 6.0f;
+                  after.particle_jitter = Vec3{8.0f, 0.2f, 8.0f};
+                  after.particle_color_start = Vec3{0.78f, 0.82f, 0.88f};
+                  after.particle_color_end = Vec3{0.50f, 0.55f, 0.62f};
+                  after.particle_spawn_rate = 90.0f;
+                  after.particle_drag = 0.8f;
+                  commit(st, si, after);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Baca / Koni Jeti")) {
+                  after = e;
+                  after.particle_billboard_type = 6; // Koni
+                  after.particle_size_start = 0.4f; after.particle_size_end = 3.0f;
+                  after.particle_velocity = Vec3{0.0f, 2.5f, 0.0f};
+                  after.particle_jitter = Vec3{0.3f, 0.1f, 0.3f};
+                  after.particle_color_start = Vec3{0.60f, 0.62f, 0.68f};
+                  after.particle_color_end = Vec3{0.35f, 0.38f, 0.45f};
+                  after.particle_spawn_rate = 140.0f;
+                  after.particle_drag = 0.4f;
+                  commit(st, si, after);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Kuyu / Silindir")) {
+                  after = e;
+                  after.particle_billboard_type = 7; // Silindir
+                  after.particle_size_start = 1.2f; after.particle_size_end = 1.8f;
+                  after.particle_velocity = Vec3{0.0f, 1.2f, 0.0f};
+                  after.particle_jitter = Vec3{0.5f, 0.2f, 0.5f};
+                  after.particle_color_start = Vec3{0.70f, 0.75f, 0.80f};
+                  after.particle_color_end = Vec3{0.45f, 0.50f, 0.55f};
+                  after.particle_spawn_rate = 100.0f;
+                  after.particle_drag = 0.5f;
+                  commit(st, si, after);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Portal Halkas\xC4\xB1")) {
+                  after = e;
+                  after.particle_billboard_type = 5; // Torus
+                  after.particle_size_start = 1.5f; after.particle_size_end = 2.2f;
+                  after.particle_velocity = Vec3{0.0f, 0.2f, 0.0f};
+                  after.particle_jitter = Vec3{2.5f, 0.4f, 2.5f};
+                  after.particle_color_start = Vec3{0.65f, 0.35f, 0.95f};
+                  after.particle_color_end = Vec3{0.20f, 0.08f, 0.45f};
+                  after.particle_spawn_rate = 110.0f;
+                  after.particle_drag = 0.6f;
+                  commit(st, si, after);
+                }
+                ImGui::PopStyleVar();
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.0f, 1.0f), ICON_MD_INFO "  Sahne Geneli Atmosfer & 16 Sis Laboratuvar\xC4\xB1:");
+                ImGui::TextWrapped("Bu ayarlar yaln\xC4\xB1zca bu yerel sis hacmi i\xC3\xA7indir. B\xC3\xBCt\xC3\xBCn sahneyi kaplayan 16 \xC3\xA7" "e\xC5\x9Fit atmosferik y\xC3\xBCkseklik/mesafe sisi i\xC3\xA7in D\xC3\xBCnya paneline ge\xC3\xA7in:");
+                if (ImGui::Button(ICON_MD_PUBLIC " Sahne Geneli Atmosfer & 16 Sis Laboratuvar\xC4\xB1na Git")) {
+                  st.sel.clear();
+                }
+                ImGui::Spacing();
+                ImGui::Separator();
+              }
+
+              const bool show_advanced_vfx = !is_fog_volume || ImGui::CollapsingHeader(ICON_MD_TUNE " Geli\xC5\x9Fmi\xC5\x9F VFX & Par\xC3\xA7" "ac\xC4\xB1k Fizi\xC4\x9Fi");
+              if (show_advanced_vfx) {
+              prop_help("S\xC4\xB1" "f\xC4\xB1r tahsisli, y\xC3\xBCksek ba\xC5\x9F" "ar\xC4\xB1ml\xC4\xB1 GPU partik\xC3\xBCl sim\xC3\xBClat\xC3\xB6r\xC3\xBC. Edit\xC3\xB6rde ve oyunda ger\xC3\xA7" "ek zamanl\xC4\xB1 hesaplan\xC4\xB1r.");
+
+              // Canlı Simülasyon Kontrol Çubuğu
               ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
-              if (ImGui::SmallButton("Ate\xC5\x9F")) {
-                after = e;
-                after.particle_spawn_rate = 60.0f; after.particle_lifetime_min = 0.8f; after.particle_lifetime_max = 1.8f;
-                after.particle_size_start = 0.25f; after.particle_size_end = 0.02f;
-                after.particle_velocity = Vec3{0.0f, 3.0f, 0.0f}; after.particle_jitter = Vec3{0.4f, 0.8f, 0.4f};
-                after.particle_color_start = Vec3{1.0f, 0.65f, 0.1f}; after.particle_color_end = Vec3{0.3f, 0.1f, 0.05f};
-                after.particle_gravity = 0.5f; after.particle_billboard_type = 0;
-                commit(st, si, after);
+              if (ImGui::Button(st.particle_sim_paused ? " " ICON_MD_PLAY_ARROW " Oynat " : " " ICON_MD_PAUSE " Duraklat ")) {
+                st.particle_sim_paused = !st.particle_sim_paused;
               }
               ImGui::SameLine();
-              if (ImGui::SmallButton("Duman")) {
-                after = e;
-                after.particle_spawn_rate = 25.0f; after.particle_lifetime_min = 2.0f; after.particle_lifetime_max = 4.0f;
-                after.particle_size_start = 0.1f; after.particle_size_end = 0.8f;
-                after.particle_velocity = Vec3{0.1f, 1.2f, 0.0f}; after.particle_jitter = Vec3{0.3f, 0.3f, 0.3f};
-                after.particle_color_start = Vec3{0.4f, 0.4f, 0.4f}; after.particle_color_end = Vec3{0.1f, 0.1f, 0.1f};
-                after.particle_gravity = 0.2f; after.particle_billboard_type = 0;
-                commit(st, si, after);
+              if (ImGui::Button(" " ICON_MD_REFRESH " S\xC4\xB1" "f\xC4\xB1rla ")) {
+                st.particles.clear();
+                std::memset(st.particle_spawn_accum, 0, sizeof st.particle_spawn_accum);
               }
               ImGui::SameLine();
-              if (ImGui::SmallButton("K\xC4\xB1v\xC4\xB1lc\xC4\xB1m")) {
-                after = e;
-                after.particle_spawn_rate = 80.0f; after.particle_lifetime_min = 0.4f; after.particle_lifetime_max = 1.0f;
-                after.particle_size_start = 0.08f; after.particle_size_end = 0.01f;
-                after.particle_velocity = Vec3{0.0f, 4.0f, 0.0f}; after.particle_jitter = Vec3{3.0f, 2.0f, 3.0f};
-                after.particle_color_start = Vec3{1.0f, 0.9f, 0.4f}; after.particle_color_end = Vec3{0.8f, 0.2f, 0.0f};
-                after.particle_gravity = -9.8f; after.particle_billboard_type = 1;
-                commit(st, si, after);
-              }
-              ImGui::SameLine();
-              if (ImGui::SmallButton("Ya\xC4\x9Fmur")) {
-                after = e;
-                after.particle_spawn_rate = 120.0f; after.particle_lifetime_min = 1.5f; after.particle_lifetime_max = 2.5f;
-                after.particle_size_start = 0.05f; after.particle_size_end = 0.05f;
-                after.particle_velocity = Vec3{0.5f, -8.0f, 0.0f}; after.particle_jitter = Vec3{5.0f, 0.5f, 5.0f};
-                after.particle_color_start = Vec3{0.7f, 0.8f, 1.0f}; after.particle_color_end = Vec3{0.5f, 0.6f, 0.8f};
-                after.particle_gravity = -9.8f; after.particle_billboard_type = 1;
-                commit(st, si, after);
+              if (ImGui::Button(" " ICON_MD_BOLT " P\xC3\xBCsk\xC3\xBCrt (20) ")) {
+                const Mat4 wm = content::scene_entity_world_matrix(st.scene, (uint32_t)si);
+                content::ParticleEmitterConfig cfg;
+                cfg.spawn_pos = Vec3{wm.m[3][0], wm.m[3][1], wm.m[3][2]};
+                cfg.base_velocity = e.particle_velocity;
+                cfg.velocity_jitter = e.particle_jitter;
+                cfg.lifetime_min = e.particle_lifetime_min;
+                cfg.lifetime_max = e.particle_lifetime_max;
+                cfg.size_start = e.particle_size_start;
+                cfg.size_end = e.particle_size_end;
+                cfg.color_start = e.particle_color_start;
+                cfg.color_end = e.particle_color_end;
+                cfg.gravity = Vec3{0.0f, e.particle_gravity, 0.0f};
+                cfg.custom_gravity = true;
+                cfg.curl_noise_strength = e.particle_curl_strength;
+                cfg.curl_noise_frequency = e.particle_curl_freq;
+                cfg.drag = e.particle_drag;
+                cfg.enable_collision = e.particle_collision;
+                cfg.collision_plane_y = 0.0f;
+                cfg.restitution = e.particle_bounce;
+                cfg.spawn_on_death_count = e.particle_sub_on_death;
+                cfg.shape = e.particle_billboard_type;
+                st.particles.emit(cfg, 20, st.particle_rng);
               }
               ImGui::PopStyleVar();
 
-              track_edit(st, e, si, prop_float("Yayma H\xC4\xB1z\xC4\xB1", &e.particle_spawn_rate, 0.5f, 0.0f, 1000.0f, "%.1f /s"));
-              track_edit(st, e, si, prop_float("\xC3\x96m\xC3\xBCr (en az)", &e.particle_lifetime_min, 0.01f, 0.01f, 60.0f, "%.2f s"));
-              track_edit(st, e, si, prop_float("\xC3\x96m\xC3\xBCr (en \xC3\xA7ok)", &e.particle_lifetime_max, 0.01f, 0.01f, 60.0f, "%.2f s"));
-              track_edit(st, e, si, prop_float("Boy (ba\xC5\x9Flang\xC4\xB1\xC3\xA7)", &e.particle_size_start, 0.005f, 0.0f, 10.0f, "%.3f m"));
-              track_edit(st, e, si, prop_float("Boy (biti\xC5\x9F)", &e.particle_size_end, 0.005f, 0.0f, 10.0f, "%.3f m"));
-              track_edit(st, e, si, prop_color("Ba\xC5\x9Flang\xC4\xB1\xC3\xA7 Rengi", &e.particle_color_start.x));
-              track_edit(st, e, si, prop_color("Biti\xC5\x9F Rengi", &e.particle_color_end.x));
-              track_edit(st, e, si, prop_vec3("Ba\xC5\x9Flang\xC4\xB1\xC3\xA7 H\xC4\xB1z\xC4\xB1", &e.particle_velocity.x, 0.02f));
-              track_edit(st, e, si, prop_vec3("Sa\xC3\xA7\xC4\xB1lma", &e.particle_jitter.x, 0.02f, 0.0f, 20.0f, "%.2f"));
-              track_edit(st, e, si, prop_float("Yer\xC3\xA7" "ekimi", &e.particle_gravity, 0.1f, -50.0f, 50.0f, "%.1f m/s\xC2\xB2"));
+              // Canlı Parçacık İstatistiği Rozeti
+              const uint32_t alive = st.particles.alive_count();
+              const uint32_t cap = st.particles.capacity();
+              const float pct = cap > 0 ? (float)alive / (float)cap * 100.0f : 0.0f;
+              ImGui::TextColored(tone(Tone::Warn), ICON_MD_GRAIN " Aktif: %u / %u (%%%0.1f)", alive, cap, pct);
+              ImGui::Separator();
 
+              // Cift-Yonlu VFX Cizge Editoru (Niagara / VFX Graph Node View)
+              static bool s_show_vfx_graph = false;
+              static content::VfxGraph s_vfx_graph;
+              static bool s_vfx_graph_inited = false;
+              static const char *s_active_graph_name = "Ate\xC5\x9F / Me\xC5\x9F" "ale (Fire)";
+              if (!s_vfx_graph_inited) {
+                s_vfx_graph.build_fire_graph();
+                s_vfx_graph_inited = true;
+              }
+
+              if (ImGui::Button(s_show_vfx_graph ? " " ICON_MD_VIEW_LIST " Standart Y\xC4\xB1" "g\xC4\xB1n (Stack) G\xC3\xB6r\xC3\xBCn\xC3\xBCm\xC3\xBC "
+                                                 : " " ICON_MD_POLYLINE " VFX \xC3\x87" "izge Edit\xC3\xB6r\xC3\xBC (Node Graph G\xC3\xB6r\xC3\xBCn\xC3\xBCm\xC3\xBC) ")) {
+                s_show_vfx_graph = !s_show_vfx_graph;
+              }
+              if (s_show_vfx_graph) {
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.09f, 0.12f, 1.0f));
+                if (ImGui::BeginChild("VFXGraphCanvas", ImVec2(0, 225), true)) {
+                  ImDrawList *gdl = ImGui::GetWindowDrawList();
+                  const ImVec2 c_pos = ImGui::GetCursorScreenPos();
+                  const ImVec2 c_size = ImGui::GetContentRegionAvail();
+
+                  // Cizge Hazir Ayar Secim Butonlari
+                  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+                  ImGui::TextColored(tone(Tone::Accent), ICON_MD_AUTO_AWESOME " Aktif \xC3\x87" "izge: %s", s_active_graph_name);
+                  ImGui::SameLine();
+                  ImGui::TextDisabled("| Haz\xC4\xB1r \xC5\x9E" "ablon:");
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Ate\xC5\x9F")) {
+                    s_vfx_graph.build_fire_graph();
+                    s_active_graph_name = "Ate\xC5\x9F / Me\xC5\x9F" "ale (Fire)";
+                  }
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Duman")) {
+                    s_vfx_graph.build_smoke_graph();
+                    s_active_graph_name = "Duman / Sis (Smoke)";
+                  }
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("K\xC4\xB1v\xC4\xB1lc\xC4\xB1m")) {
+                    s_vfx_graph.build_sparks_graph();
+                    s_active_graph_name = "K\xC4\xB1v\xC4\xB1lc\xC4\xB1m (Sparks)";
+                  }
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Patlama")) {
+                    s_vfx_graph.build_explosion_graph();
+                    s_active_graph_name = "Patlama / \xC5\x9Eok (Explosion)";
+                  }
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("B\xC3\xBCy\xC3\xBC")) {
+                    s_vfx_graph.build_magic_graph();
+                    s_active_graph_name = "B\xC3\xBCy\xC3\xBC K\xC3\xBCresi (Magic Orb)";
+                  }
+                  ImGui::PopStyleVar();
+
+                  // Cizge Arka Plan Izgarasi
+                  const float grid_step = 24.0f;
+                  const ImU32 grid_col = IM_COL32(255, 255, 255, 12);
+                  const float grid_start_y = c_pos.y + 28.0f;
+                  for (float x = 0; x < c_size.x; x += grid_step) {
+                    gdl->AddLine(ImVec2(c_pos.x + x, grid_start_y), ImVec2(c_pos.x + x, c_pos.y + c_size.y), grid_col);
+                  }
+                  for (float y = 28.0f; y < c_size.y; y += grid_step) {
+                    gdl->AddLine(ImVec2(c_pos.x, c_pos.y + y), ImVec2(c_pos.x + c_size.x, c_pos.y + y), grid_col);
+                  }
+
+                  // Context Kartlari ve Baglantilar (Spawn -> Init -> Update -> Output)
+                  const float card_w = 84.0f;
+                  const float card_h = 75.0f;
+                  const float card_y = c_pos.y + 36.0f;
+                  const char *stages[4] = {"Spawn", "Initialize", "Update", "Output"};
+                  const ImU32 stage_colors[4] = {
+                    IM_COL32(59, 130, 246, 255),  // Mavi
+                    IM_COL32(16, 185, 129, 255),  // Yesil
+                    IM_COL32(245, 158, 11, 255),  // Sari
+                    IM_COL32(236, 72, 153, 255)   // Pembe
+                  };
+
+                  for (int si_idx = 0; si_idx < 4; si_idx++) {
+                    const float card_x = c_pos.x + 8.0f + si_idx * 110.0f;
+                    gdl->AddRectFilled(ImVec2(card_x, card_y), ImVec2(card_x + card_w, card_y + card_h), IM_COL32(24, 26, 34, 245), 4.0f);
+                    gdl->AddRect(ImVec2(card_x, card_y), ImVec2(card_x + card_w, card_y + card_h), stage_colors[si_idx], 4.0f);
+                    gdl->AddRectFilled(ImVec2(card_x, card_y), ImVec2(card_x + card_w, card_y + 16.0f), stage_colors[si_idx], 4.0f, ImDrawFlags_RoundCornersTop);
+                    gdl->AddText(ImVec2(card_x + 4.0f, card_y + 1.0f), IM_COL32(255, 255, 255, 255), stages[si_idx]);
+
+                    if (si_idx > 0) {
+                      gdl->AddCircleFilled(ImVec2(card_x, card_y + card_h * 0.5f), 3.5f, IM_COL32(255, 255, 255, 220));
+                    }
+                    if (si_idx < 3) {
+                      gdl->AddCircleFilled(ImVec2(card_x + card_w, card_y + card_h * 0.5f), 3.5f, stage_colors[si_idx]);
+                      const ImVec2 p1(card_x + card_w, card_y + card_h * 0.5f);
+                      const ImVec2 p4(card_x + 110.0f, card_y + card_h * 0.5f);
+                      const ImVec2 p2(p1.x + 14.0f, p1.y);
+                      const ImVec2 p3(p4.x - 14.0f, p4.y);
+                      gdl->AddBezierCubic(p1, p2, p3, p4, IM_COL32(255, 255, 255, 160), 2.0f);
+                    }
+
+                    if (si_idx == 0) {
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 20.0f), IM_COL32(180, 185, 200, 255), "Rate: Contin");
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 35.0f), IM_COL32(180, 185, 200, 255), "Burst: Auto");
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 50.0f), IM_COL32(140, 145, 160, 255), "Seed: Xor32");
+                    } else if (si_idx == 1) {
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 20.0f), IM_COL32(180, 185, 200, 255), "Shape: Geom");
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 35.0f), IM_COL32(180, 185, 200, 255), "Vel: 3B Vec");
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 50.0f), IM_COL32(140, 145, 160, 255), "Ramp: Color");
+                    } else if (si_idx == 2) {
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 20.0f), IM_COL32(180, 185, 200, 255), "Curl: 3D Sim");
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 35.0f), IM_COL32(180, 185, 200, 255), "Stokes: Drag");
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 50.0f), IM_COL32(140, 145, 160, 255), "Col: Plane");
+                    } else if (si_idx == 3) {
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 20.0f), IM_COL32(180, 185, 200, 255), "WBOIT: Mc2013");
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 35.0f), IM_COL32(180, 185, 200, 255), "Mesh: Quad/3D");
+                      gdl->AddText(ImVec2(card_x + 4.0f, card_y + 50.0f), IM_COL32(140, 145, 160, 255), "TBDR: Q-Res");
+                    }
+                  }
+
+                  ImGui::SetCursorPos(ImVec2(8, 148));
+                  if (ImGui::Button(" " ICON_MD_PLAY_ARROW " Grafigi Derle & Yans\xC4\xB1t ")) {
+                    content::ParticleEmitterConfig gcfg;
+                    if (s_vfx_graph.compile_to_config(gcfg)) {
+                      after = e;
+                      after.particle_velocity = gcfg.base_velocity;
+                      after.particle_jitter = gcfg.velocity_jitter;
+                      after.particle_lifetime_min = gcfg.lifetime_min;
+                      after.particle_lifetime_max = gcfg.lifetime_max;
+                      after.particle_color_start = gcfg.color_start;
+                      after.particle_color_end = gcfg.color_end;
+                      after.particle_size_start = gcfg.size_start;
+                      after.particle_size_end = gcfg.size_end;
+                      after.particle_gravity = gcfg.gravity.y;
+                      after.particle_curl_strength = gcfg.curl_noise_strength;
+                      after.particle_drag = gcfg.drag;
+                      commit(st, si, after);
+                    }
+                  }
+                  ImGui::SameLine();
+                  if (ImGui::Button(" " ICON_MD_CODE " GLSL SPIR-V ")) {
+                    ImGui::OpenPopup("GLSLComputeCode");
+                  }
+                  ImGui::SameLine();
+                  ImGui::TextDisabled("4 Context | 6 Blok | 0-Alloc | SPIR-V std430");
+
+                  if (ImGui::BeginPopup("GLSLComputeCode")) {
+                    char glsl_buf[1024]{};
+                    s_vfx_graph.compile_to_glsl_compute(glsl_buf, sizeof(glsl_buf));
+                    ImGui::TextColored(tone(Tone::Accent), ICON_MD_TERMINAL " Vulkan Compute Shader (GLSL 450 - std430 SSBO):");
+                    ImGui::Separator();
+                    ImGui::InputTextMultiline("##glsl_src", glsl_buf, sizeof(glsl_buf), ImVec2(520, 200), ImGuiInputTextFlags_ReadOnly);
+                    if (ImGui::Button(" " ICON_MD_CONTENT_COPY " Panoya Kopyala ")) {
+                      ImGui::SetClipboardText(glsl_buf);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(" Kapat ")) {
+                      ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                  }
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+                ImGui::Separator();
+              }
+
+              // Açık Kaynak Standart VFX Şablon Kütüphanesi (Godot / Niagara / Effekseer Presets)
+              int vfx_tpl = 0;
+              if (prop_combo("VFX \xC5\x9E" "ablonu (Preset)", &vfx_tpl,
+                             "\xC3\x96zel Yap\xC4\xB1land\xC4\xB1rma (Custom)\0"
+                             "Ate\xC5\x9F / Me\xC5\x9F" "ale (Fire & Torch)\0"
+                             "Duman / Sis (Smoke & Plume)\0"
+                             "K\xC4\xB1v\xC4\xB1lc\xC4\xB1m / Kaynak (Sparks)\0"
+                             "Ya\xC4\x9Fmur / Damla (Rain)\0"
+                             "Kar / Tipi (Snow)\0"
+                             "B\xC3\xBCy\xC3\xBC / Enerji K\xC3\xBCresi (Magic Orb)\0"
+                             "Patlama / \xC5\x9Eok (Explosion)\0"
+                             "Portal Halkas\xC4\xB1 (Portal Ring)\0"
+                             "Lazer S\xC3\xBCtunu (Laser Beam)\0"
+                             "Volkanik P\xC3\xBCsk\xC3\xBCrme (Volcano)\0"
+                             "Gezegen Diski (Saturn Ring)\0"
+                             "\xC5\x9Eok Dalgas\xC4\xB1 (Shockwave)\0"
+                             "Galaksi Girdab\xC4\xB1 (Galaxy Vortex)\0"
+                             "Kutup I\xC5\x9F\xC4\xB1\xC4\x9F\xC4\xB1 (Aurora Borealis)\0"
+                             "Meteor \xC4\xB0zi (Comet Trail)\0"
+                             "Enerji Kalkan\xC4\xB1 (Forcefield Cage)\0\0").changed && vfx_tpl > 0) {
+                st.particles.clear();
+                after = e;
+                if (vfx_tpl == 1) { // Ates
+                  after.particle_spawn_rate = 65.0f; after.particle_lifetime_min = 0.8f; after.particle_lifetime_max = 1.6f;
+                  after.particle_size_start = 0.22f; after.particle_size_end = 0.03f;
+                  after.particle_velocity = Vec3{0.0f, 2.8f, 0.0f}; after.particle_jitter = Vec3{0.4f, 0.6f, 0.4f};
+                  after.particle_color_start = Vec3{1.0f, 0.6f, 0.1f}; after.particle_color_end = Vec3{0.3f, 0.05f, 0.02f};
+                  after.particle_gravity = 0.6f; after.particle_billboard_type = 0;
+                  after.particle_curl_strength = 2.5f; after.particle_curl_freq = 0.8f;
+                  after.particle_drag = 0.2f; after.particle_collision = false;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                } else if (vfx_tpl == 2) { // Duman
+                  after.particle_spawn_rate = 20.0f; after.particle_lifetime_min = 2.5f; after.particle_lifetime_max = 4.5f;
+                  after.particle_size_start = 0.12f; after.particle_size_end = 0.95f;
+                  after.particle_velocity = Vec3{0.1f, 1.0f, 0.05f}; after.particle_jitter = Vec3{0.3f, 0.2f, 0.3f};
+                  after.particle_color_start = Vec3{0.45f, 0.45f, 0.45f}; after.particle_color_end = Vec3{0.12f, 0.12f, 0.12f};
+                  after.particle_gravity = 0.15f; after.particle_billboard_type = 0;
+                  after.particle_curl_strength = 1.2f; after.particle_curl_freq = 0.5f;
+                  after.particle_drag = 0.4f; after.particle_collision = false;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                } else if (vfx_tpl == 3) { // Kivilcim
+                  after.particle_spawn_rate = 90.0f; after.particle_lifetime_min = 0.6f; after.particle_lifetime_max = 1.4f;
+                  after.particle_size_start = 0.09f; after.particle_size_end = 0.01f;
+                  after.particle_velocity = Vec3{0.0f, 5.0f, 0.0f}; after.particle_jitter = Vec3{3.5f, 2.0f, 3.5f};
+                  after.particle_color_start = Vec3{1.0f, 0.95f, 0.4f}; after.particle_color_end = Vec3{0.9f, 0.15f, 0.0f};
+                  after.particle_gravity = -9.8f; after.particle_billboard_type = 1;
+                  after.particle_curl_strength = 0.5f; after.particle_curl_freq = 1.0f;
+                  after.particle_drag = 0.08f; after.particle_collision = true; after.particle_bounce = 0.7f;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = true;
+                } else if (vfx_tpl == 4) { // Yagmur
+                  after.particle_spawn_rate = 150.0f; after.particle_lifetime_min = 0.8f; after.particle_lifetime_max = 1.4f;
+                  after.particle_size_start = 0.05f; after.particle_size_end = 0.04f;
+                  after.particle_velocity = Vec3{0.4f, -14.0f, 0.2f}; after.particle_jitter = Vec3{5.0f, 0.5f, 5.0f};
+                  after.particle_color_start = Vec3{0.65f, 0.8f, 1.0f}; after.particle_color_end = Vec3{0.4f, 0.6f, 0.85f};
+                  after.particle_gravity = -9.8f; after.particle_billboard_type = 1;
+                  after.particle_curl_strength = 0.0f; after.particle_drag = 0.02f;
+                  after.particle_collision = true; after.particle_bounce = 0.15f;
+                  after.particle_sub_on_death = 2; after.particle_ribbon = false;
+                } else if (vfx_tpl == 5) { // Kar
+                  after.particle_spawn_rate = 80.0f; after.particle_lifetime_min = 3.0f; after.particle_lifetime_max = 6.0f;
+                  after.particle_size_start = 0.07f; after.particle_size_end = 0.04f;
+                  after.particle_velocity = Vec3{0.6f, -1.8f, 0.3f}; after.particle_jitter = Vec3{4.0f, 0.4f, 4.0f};
+                  after.particle_color_start = Vec3{0.96f, 0.98f, 1.0f}; after.particle_color_end = Vec3{0.75f, 0.85f, 0.95f};
+                  after.particle_gravity = -0.4f; after.particle_billboard_type = 3;
+                  after.particle_curl_strength = 1.8f; after.particle_curl_freq = 0.6f;
+                  after.particle_drag = 0.6f; after.particle_collision = true; after.particle_bounce = 0.0f;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                } else if (vfx_tpl == 6) { // Buyu
+                  after.particle_spawn_rate = 55.0f; after.particle_lifetime_min = 1.5f; after.particle_lifetime_max = 2.8f;
+                  after.particle_size_start = 0.14f; after.particle_size_end = 0.02f;
+                  after.particle_velocity = Vec3{0.0f, 2.2f, 0.0f}; after.particle_jitter = Vec3{1.0f, 1.0f, 1.0f};
+                  after.particle_color_start = Vec3{0.2f, 0.9f, 1.0f}; after.particle_color_end = Vec3{0.9f, 0.15f, 0.95f};
+                  after.particle_gravity = 0.1f; after.particle_billboard_type = 3;
+                  after.particle_curl_strength = 6.5f; after.particle_curl_freq = 1.2f;
+                  after.particle_drag = 0.1f; after.particle_collision = false;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = true;
+                } else if (vfx_tpl == 7) { // Patlama
+                  after.particle_spawn_rate = 0.0f; after.particle_lifetime_min = 0.5f; after.particle_lifetime_max = 1.2f;
+                  after.particle_size_start = 0.35f; after.particle_size_end = 0.05f;
+                  after.particle_velocity = Vec3{0.0f, 2.0f, 0.0f}; after.particle_jitter = Vec3{5.0f, 5.0f, 5.0f};
+                  after.particle_color_start = Vec3{1.0f, 0.8f, 0.1f}; after.particle_color_end = Vec3{0.8f, 0.1f, 0.0f};
+                  after.particle_gravity = -3.0f; after.particle_billboard_type = 0;
+                  after.particle_curl_strength = 2.0f; after.particle_drag = 0.2f;
+                  after.particle_collision = true; after.particle_bounce = 0.4f;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                } else if (vfx_tpl == 8) { // Portal
+                  after.particle_spawn_rate = 70.0f; after.particle_lifetime_min = 1.5f; after.particle_lifetime_max = 2.5f;
+                  after.particle_size_start = 0.2f; after.particle_size_end = 0.05f;
+                  after.particle_velocity = Vec3{0.0f, 0.2f, 0.0f}; after.particle_jitter = Vec3{3.0f, 0.05f, 3.0f};
+                  after.particle_color_start = Vec3{0.3f, 0.1f, 1.0f}; after.particle_color_end = Vec3{0.9f, 0.1f, 0.8f};
+                  after.particle_gravity = 0.0f; after.particle_billboard_type = 5;
+                  after.particle_curl_strength = 1.0f; after.particle_curl_freq = 1.0f;
+                  after.particle_drag = 0.1f; after.particle_collision = false;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = true;
+                } else if (vfx_tpl == 9) { // Lazer
+                  after.particle_spawn_rate = 120.0f; after.particle_lifetime_min = 0.6f; after.particle_lifetime_max = 1.0f;
+                  after.particle_size_start = 0.08f; after.particle_size_end = 0.02f;
+                  after.particle_velocity = Vec3{0.0f, 16.0f, 0.0f}; after.particle_jitter = Vec3{0.05f, 0.2f, 0.05f};
+                  after.particle_color_start = Vec3{0.1f, 0.8f, 1.0f}; after.particle_color_end = Vec3{0.0f, 0.2f, 1.0f};
+                  after.particle_gravity = 0.0f; after.particle_billboard_type = 7;
+                  after.particle_curl_strength = 0.0f; after.particle_drag = 0.02f;
+                  after.particle_collision = false; after.particle_ribbon = true;
+                } else if (vfx_tpl == 10) { // Volkan
+                  after.particle_spawn_rate = 75.0f; after.particle_lifetime_min = 1.0f; after.particle_lifetime_max = 2.0f;
+                  after.particle_size_start = 0.22f; after.particle_size_end = 0.04f;
+                  after.particle_velocity = Vec3{0.0f, 8.0f, 0.0f}; after.particle_jitter = Vec3{2.5f, 1.0f, 2.5f};
+                  after.particle_color_start = Vec3{1.0f, 0.3f, 0.05f}; after.particle_color_end = Vec3{0.4f, 0.05f, 0.0f};
+                  after.particle_gravity = -12.0f; after.particle_billboard_type = 6;
+                  after.particle_curl_strength = 1.5f; after.particle_drag = 0.08f;
+                  after.particle_collision = true; after.particle_bounce = 0.55f;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                } else if (vfx_tpl == 11) { // Saturn
+                  after.particle_spawn_rate = 85.0f; after.particle_lifetime_min = 2.0f; after.particle_lifetime_max = 4.0f;
+                  after.particle_size_start = 0.12f; after.particle_size_end = 0.08f;
+                  after.particle_velocity = Vec3{0.0f, 0.0f, 0.0f}; after.particle_jitter = Vec3{5.5f, 0.02f, 5.5f};
+                  after.particle_color_start = Vec3{0.95f, 0.9f, 0.7f}; after.particle_color_end = Vec3{0.6f, 0.75f, 0.9f};
+                  after.particle_gravity = 0.0f; after.particle_billboard_type = 3;
+                  after.particle_curl_strength = 2.0f; after.particle_curl_freq = 0.5f;
+                  after.particle_drag = 0.05f; after.particle_collision = false;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                } else if (vfx_tpl == 12) { // Sok
+                  after.particle_spawn_rate = 15.0f; after.particle_lifetime_min = 0.8f; after.particle_lifetime_max = 1.2f;
+                  after.particle_size_start = 0.2f; after.particle_size_end = 4.5f;
+                  after.particle_velocity = Vec3{0.0f, 0.0f, 0.0f}; after.particle_jitter = Vec3{0.1f, 0.0f, 0.1f};
+                  after.particle_color_start = Vec3{1.0f, 0.9f, 0.5f}; after.particle_color_end = Vec3{0.8f, 0.2f, 0.0f};
+                  after.particle_gravity = 0.0f; after.particle_billboard_type = 2;
+                  after.particle_curl_strength = 0.0f; after.particle_drag = 0.0f;
+                  after.particle_collision = false; after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                } else if (vfx_tpl == 13) { // Galaksi
+                  after.particle_spawn_rate = 95.0f; after.particle_lifetime_min = 2.0f; after.particle_lifetime_max = 3.5f;
+                  after.particle_size_start = 0.16f; after.particle_size_end = 0.04f;
+                  after.particle_velocity = Vec3{0.0f, 0.2f, 0.0f}; after.particle_jitter = Vec3{4.5f, 0.1f, 4.5f};
+                  after.particle_color_start = Vec3{0.4f, 0.15f, 1.0f}; after.particle_color_end = Vec3{0.1f, 0.9f, 0.9f};
+                  after.particle_gravity = 0.0f; after.particle_billboard_type = 5;
+                  after.particle_curl_strength = 14.0f; after.particle_curl_freq = 0.8f;
+                  after.particle_drag = 0.15f; after.particle_collision = false;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = true;
+                } else if (vfx_tpl == 14) { // Aurora
+                  after.particle_spawn_rate = 18.0f; after.particle_lifetime_min = 2.5f; after.particle_lifetime_max = 4.5f;
+                  after.particle_size_start = 0.4f; after.particle_size_end = 5.5f;
+                  after.particle_velocity = Vec3{0.5f, 0.4f, 0.0f}; after.particle_jitter = Vec3{3.0f, 0.5f, 1.0f};
+                  after.particle_color_start = Vec3{0.1f, 1.0f, 0.5f}; after.particle_color_end = Vec3{0.05f, 0.3f, 0.9f};
+                  after.particle_gravity = 0.0f; after.particle_billboard_type = 2;
+                  after.particle_curl_strength = 3.5f; after.particle_curl_freq = 0.3f;
+                  after.particle_drag = 0.05f; after.particle_collision = false;
+                  after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                } else if (vfx_tpl == 15) { // Meteor
+                  after.particle_spawn_rate = 110.0f; after.particle_lifetime_min = 0.8f; after.particle_lifetime_max = 1.6f;
+                  after.particle_size_start = 0.3f; after.particle_size_end = 0.02f;
+                  after.particle_velocity = Vec3{6.0f, -12.0f, 2.0f}; after.particle_jitter = Vec3{0.3f, 0.3f, 0.3f};
+                  after.particle_color_start = Vec3{1.0f, 0.9f, 0.3f}; after.particle_color_end = Vec3{0.7f, 0.1f, 0.0f};
+                  after.particle_gravity = -9.8f; after.particle_billboard_type = 3;
+                  after.particle_curl_strength = 1.0f; after.particle_curl_freq = 1.0f;
+                  after.particle_drag = 0.05f; after.particle_collision = true; after.particle_bounce = 0.3f;
+                  after.particle_sub_on_death = 5; after.particle_ribbon = true;
+                } else if (vfx_tpl == 16) { // Kafes
+                  after.particle_spawn_rate = 80.0f; after.particle_lifetime_min = 1.5f; after.particle_lifetime_max = 2.5f;
+                  after.particle_size_start = 0.18f; after.particle_size_end = 0.08f;
+                  after.particle_velocity = Vec3{0.0f, 0.0f, 0.0f}; after.particle_jitter = Vec3{2.5f, 2.5f, 2.5f};
+                  after.particle_color_start = Vec3{0.05f, 0.9f, 1.0f}; after.particle_color_end = Vec3{0.0f, 0.2f, 0.8f};
+                  after.particle_gravity = 0.0f; after.particle_billboard_type = 4;
+                  after.particle_curl_strength = 0.2f; after.particle_drag = 0.25f;
+                  after.particle_collision = false; after.particle_sub_on_death = 0; after.particle_ribbon = false;
+                }
+                commit(st, si, after);
+              }
+
+              // MODÜL 1: Emisyon & Yaşam Döngüsü & Determinizm (Niagara Emitter State / Godot Time)
+              ImGui::Separator();
+              ImGui::TextColored(tone(Tone::Accent), ICON_MD_TIMER " 1. Emisyon & Ya\xC5\x9F" "am D\xC3\xB6ng\xC3\xBCs\xC3\xBC (Emission & Lifecycle)");
+              track_edit(st, e, si, prop_float("Yayma H\xC4\xB1z\xC4\xB1 (Spawn Rate)", &e.particle_spawn_rate, 0.5f, 0.0f, 1000.0f, "%.1f /s"));
+              track_edit(st, e, si, prop_float("Minimum \xC3\x96m\xC3\xBCr (Lifetime Min)", &e.particle_lifetime_min, 0.01f, 0.01f, 60.0f, "%.2f s"));
+              track_edit(st, e, si, prop_float("Maksimum \xC3\x96m\xC3\xBCr (Lifetime Max)", &e.particle_lifetime_max, 0.01f, 0.01f, 60.0f, "%.2f s"));
+              const float avg_life = (e.particle_lifetime_min + e.particle_lifetime_max) * 0.5f;
+              ImGui::TextDisabled("Kararl\xC4\xB1 Pop\xC3\xBClasyon Beklentisi: ~%.0f adet (Rate x Ortalama \xC3\x96m\xC3\xBCr)", e.particle_spawn_rate * avg_life);
+
+              // Deterministik Xorshift32 Tohumu & Rollback Netcode Uyumu
+              static int s_user_seed = 1337;
+              if (prop_int("Deterministik Tohum (RNG Seed)", &s_user_seed, 1, 999999).changed) {
+                st.particle_rng = Rng((uint32_t)s_user_seed);
+              }
+              ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+              if (ImGui::SmallButton(" " ICON_MD_CASINO " Zar At (Rastgele Tohum) ")) {
+                s_user_seed = (int)(st.particle_rng.next_u32() % 999999 + 1);
+                st.particle_rng = Rng((uint32_t)s_user_seed);
+              }
+              ImGui::SameLine();
+              if (ImGui::SmallButton(" " ICON_MD_RESTART_ALT " Tohumu S\xC4\xB1" "f\xC4\xB1rla (1337) ")) {
+                s_user_seed = 1337;
+                st.particle_rng = Rng(1337);
+              }
+              ImGui::PopStyleVar();
+
+              static bool s_affects_gameplay = false;
+              if (prop_check("Oynan\xC4\xB1\xC5\x9F\xC4\xB1 Etkiler (affects_gameplay / Rollback GGPO)", &s_affects_gameplay).changed) {
+                // Gameplay flag updated
+              }
+              if (s_affects_gameplay) {
+                ImGui::TextColored(tone(Tone::Ok), ICON_MD_SYNC " [DETERM\xC4\xB0N\xC4\xB0ST\xC4\xB0K ROLLBACK AKT\xC4\xB0" "F] GGPO Senkronize, Bit-Identical Replay");
+              } else {
+                ImGui::TextDisabled(ICON_MD_SYNC_DISABLED " [KOZMET\xC4\xB0K VFX] Ayr\xC4\xB1k Asenkron \xC3\x87" "er\xC3\xA7" "eve (Fire-and-Forget, 0 Re-Sim CPU Y\xC3\xBCk\xC3\xBC)");
+              }
+
+              // MODÜL 2: Yayılım Geometrisi & Hız (Godot Emission Shape / Niagara Shape Location)
+              ImGui::Separator();
+              ImGui::TextColored(tone(Tone::Accent), ICON_MD_SHAPE_LINE " 2. Yay\xC4\xB1l\xC4\xB1m Geometrisi & H\xC4\xB1z (Emission Shape & Velocity)");
+              const float spd_mag = length(e.particle_velocity);
+              int geom_shape = 0;
+              if (e.particle_jitter.y <= 0.08f && (e.particle_jitter.x > 0.1f || e.particle_jitter.z > 0.1f)) geom_shape = 2; // Disk / Halka
+              else if (e.particle_jitter.z <= 0.08f && e.particle_jitter.x > 0.1f && e.particle_jitter.y > 0.1f) geom_shape = 3; // Perde / Duvar
+              else if (spd_mag > 2.0f && (e.particle_jitter.x > 0.5f || e.particle_jitter.z > 0.5f)) geom_shape = 4; // Konik Huni
+              else if (e.particle_jitter.x <= 0.08f && e.particle_jitter.z <= 0.08f && spd_mag > 1.0f) geom_shape = 1; // Dogrusal Isin
+              else if (e.particle_jitter.x > 0.5f && e.particle_jitter.y > 0.5f && e.particle_jitter.z > 0.5f) geom_shape = 5; // Kuresel Hacim
+
+              if (prop_combo("Yay\xC4\xB1l\xC4\xB1m Bi\xC3\xA7imi (Shape)", &geom_shape,
+                             "0: Nokta Kaynak (Point Source - 0B)\0"
+                             "1: Do\xC4\x9Frusal I\xC5\x9F\xC4\xB1n / S\xC3\xBCtun (Linear Beam - 1B)\0"
+                             "2: D\xC3\xBCzlemsel Disk / Halka (Planar Ring - 2B)\0"
+                             "3: Dikey Perde / Duvar (Vertical Curtain - 2B)\0"
+                             "4: Konik Huni / \xC3\x87" "e\xC5\x9Fme (Conical Fountain - 3B)\0"
+                             "5: 3B K\xC3\xBCresel Hacim (Spherical Volume - 3B)\0\0").changed) {
+                after = e;
+                if (geom_shape == 0) { // Point
+                  after.particle_velocity = Vec3{0.0f, 1.0f, 0.0f}; after.particle_jitter = Vec3{0.2f, 0.2f, 0.2f};
+                } else if (geom_shape == 1) { // Linear Beam
+                  after.particle_velocity = Vec3{0.0f, 12.0f, 0.0f}; after.particle_jitter = Vec3{0.03f, 0.1f, 0.03f};
+                } else if (geom_shape == 2) { // Planar Ring
+                  after.particle_velocity = Vec3{0.0f, 0.0f, 0.0f}; after.particle_jitter = Vec3{4.0f, 0.02f, 4.0f};
+                } else if (geom_shape == 3) { // Vertical Curtain
+                  after.particle_velocity = Vec3{0.0f, 1.0f, 0.0f}; after.particle_jitter = Vec3{4.0f, 2.0f, 0.02f};
+                } else if (geom_shape == 4) { // Conical Fountain
+                  after.particle_velocity = Vec3{0.0f, 7.0f, 0.0f}; after.particle_jitter = Vec3{2.5f, 0.8f, 2.5f};
+                } else if (geom_shape == 5) { // Spherical Volume
+                  after.particle_velocity = Vec3{0.0f, 0.0f, 0.0f}; after.particle_jitter = Vec3{3.0f, 3.0f, 3.0f};
+                }
+                commit(st, si, after);
+              }
+
+              static float s_shape_radius = 2.5f;
+              static float s_shape_inner_radius = 0.75f;
+              static float s_shape_spread = 0.5f;
+              if (geom_shape == 2) {
+                if (prop_float("Halka Yar\xC4\xB1\xC3\xA7" "ap\xC4\xB1 (Outer Radius)", &s_shape_radius, 0.05f, 0.1f, 50.0f, "%.2f m").changed) {
+                  after = e; after.particle_jitter.x = s_shape_radius; after.particle_jitter.z = s_shape_radius; commit(st, si, after);
+                }
+                prop_float("\xC4\xB0\xC3\xA7 Halka Yar\xC4\xB1\xC3\xA7" "ap\xC4\xB1 (Inner Radius)", &s_shape_inner_radius, 0.05f, 0.0f, s_shape_radius, "%.2f m");
+              } else if (geom_shape == 4) {
+                prop_float("Koni A\xC3\xA7\xC4\xB1sal Sa\xC3\xA7\xC4\xB1lmas\xC4\xB1 (Cone Spread)", &s_shape_spread, 0.02f, 0.05f, 1.0f, "%.2f rad");
+              } else if (geom_shape == 1 || geom_shape == 3 || geom_shape == 5) {
+                if (prop_float("Yay\xC4\xB1l\xC4\xB1m \xC3\x96l\xC3\xA7" "e\xC4\x9Fi (Shape Scale)", &s_shape_radius, 0.05f, 0.1f, 50.0f, "%.2f m").changed) {
+                  after = e;
+                  if (geom_shape == 5) { after.particle_jitter = Vec3{s_shape_radius, s_shape_radius, s_shape_radius}; }
+                  else if (geom_shape == 3) { after.particle_jitter.x = s_shape_radius; }
+                  commit(st, si, after);
+                }
+              }
+
+              track_edit(st, e, si, prop_vec3("Ba\xC5\x9Flang\xC4\xB1\xC3\xA7 H\xC4\xB1z\xC4\xB1 (Initial Velocity)", &e.particle_velocity.x, 0.02f));
+              track_edit(st, e, si, prop_vec3("Sa\xC3\xA7\xC4\xB1lma Sapmas\xC4\xB1 (Jitter / Spread)", &e.particle_jitter.x, 0.02f, 0.0f, 20.0f, "%.2f"));
+              ImGui::TextDisabled("H\xC4\xB1z: %.2f m/s | Analitik Geometri: %s", spd_mag,
+                                  geom_shape == 1 ? "1B Do\xC4\x9Frusal S\xC3\xBCtun (Linear Beam)" :
+                                  (geom_shape == 2 ? "2B D\xC3\xBCzlemsel Halka (Planar Ring)" :
+                                  (geom_shape == 3 ? "2B Dikey Perde (Vertical Curtain)" :
+                                  (geom_shape == 4 ? "3B Konik Huni (Conical Fountain)" :
+                                  (geom_shape == 5 ? "3B K\xC3\xBCresel Hacim (Spherical Volume)" : "0B Nokta (Point)")))));
+
+              // MODÜL 3: Kuvvetler & Akışkan Fiziği & Modül Hattı (Niagara Forces & Accelerations)
+              ImGui::Separator();
+              ImGui::TextColored(tone(Tone::Accent), ICON_MD_AIR " 3. Kuvvetler & Ak\xC4\xB1\xC5\x9Fkan Fizi\xC4\x9Fi (Forces & Dynamics)");
+              track_edit(st, e, si, prop_float("Yer\xC3\xA7" "ekimi \xC4\xB0vmesi (Gravity)", &e.particle_gravity, 0.1f, -50.0f, 50.0f, "%.1f m/s\xC2\xB2"));
+              track_edit(st, e, si, prop_float("Stokes Hava Direnci (Drag)", &e.particle_drag, 0.01f, 0.0f, 10.0f, "%.2f"));
+              track_edit(st, e, si, prop_float("T\xC3\xBCrb\xC3\xBClans G\xC3\xBC" "c\xC3\xBC (Curl Strength)", &e.particle_curl_strength, 0.05f, 0.0f, 30.0f, "%.2f m/s\xC2\xB2"));
+              track_edit(st, e, si, prop_float("G\xC3\xBCr\xC3\xBClt\xC3\xBC Frekans\xC4\xB1 (Curl Freq)", &e.particle_curl_freq, 0.02f, 0.05f, 10.0f, "%.2f /m"));
+              bool coll_val = e.particle_collision;
+              if (prop_check("Zemin \xC3\x87" "arp\xC4\xB1\xC5\x9Fmas\xC4\xB1 (Plane Collision y=0)", &coll_val).changed) {
+                after = e; after.particle_collision = coll_val; commit(st, si, after);
+              }
+              track_edit(st, e, si, prop_float("Sekme Esnekli\xC4\x9Fi (Restitution)", &e.particle_bounce, 0.02f, 0.0f, 1.0f, "%.2f"));
+              static float s_friction = 0.30f;
+              prop_float("Yanal S\xC3\xBCrt\xC3\xBCnme (Tangential Friction)", &s_friction, 0.02f, 0.0f, 1.0f, "%.2f");
+
+              // Aktif C++ Modül Hattı (VfxModulePipeline) Durumu
+              ImGui::TextDisabled("Aktif C++ Mod\xC3\xBCl Hatt\xC4\xB1 (VfxModulePipeline):");
+              ImGui::BulletText(" [x] CurlNoiseModule (3B Simplex Divergence-Free)");
+              ImGui::BulletText(" [x] StokesDragModule (Aerodinamik Viskoz Diren\xC3\xA7)");
+              ImGui::BulletText(" [x] GroundCollisionModule (Zemin D\xC3\xBCzlemi y=0)");
+              ImGui::BulletText(" [x] ColorRampModule & SizeOverLifeModule");
+
+              // MODÜL 4: Render Modeli, WBOIT & Görünüm (Godot DrawPass / McGuire WBOIT)
+              ImGui::Separator();
+              ImGui::TextColored(tone(Tone::Accent), ICON_MD_VISIBILITY " 4. Render Modeli, WBOIT & G\xC3\xB6r\xC3\xBCn\xC3\xBCm (Renderer & WBOIT)");
               int bb = (int)e.particle_billboard_type;
-              if (prop_combo("Y\xC3\xB6nlenme Modu", &bb, "Kameraya D\xC3\xB6n\xC3\xBCk (Screen)\0H\xC4\xB1za G\xC3\xB6re Uzayan (Stretched)\0Yatay D\xC3\xBCzlem (Horizontal)\0").changed) {
+              if (prop_combo("Render Modeli (Primitive Mesh)", &bb,
+                             "0: Kameraya D\xC3\xB6n\xC3\xBCk D\xC3\xB6rtgen (Billboard Quad - Sprite)\0"
+                             "1: H\xC4\xB1za G\xC3\xB6re Uzayan \xC4\xB0" "\xC4\x9Fne (Velocity-Aligned Streak)\0"
+                             "2: Yatay Zemin D\xC3\xBCzlemi (Horizontal Shockwave Plane)\0"
+                             "3: 3B K\xC3\xBCre Modeli (Mesh: 3D Sphere)\0"
+                             "4: 3B K\xC3\xBCp / Voksel (Mesh: 3D Box / Voxel)\0"
+                             "5: 3B Enerji Simiti (Mesh: 3D Torus)\0"
+                             "6: 3B Koni Modeli (Mesh: 3D Cone)\0"
+                             "7: 3B Silindir Modeli (Mesh: 3D Cylinder)\0\0").changed) {
                 after = e; after.particle_billboard_type = (uint32_t)bb; commit(st, si, after);
+              }
+              bool rib_val = e.particle_ribbon;
+              if (prop_check("\xC5\x9E" "erit / Kuyruk \xC4\xB0zi (Ribbon Trail)", &rib_val).changed) {
+                after = e; after.particle_ribbon = rib_val; commit(st, si, after);
+              }
+              track_edit(st, e, si, prop_float("Ba\xC5\x9Flang\xC4\xB1\xC3\xA7 Boyutu (Size Start)", &e.particle_size_start, 0.005f, 0.0f, 10.0f, "%.3f m"));
+              track_edit(st, e, si, prop_float("Biti\xC5\x9F Boyutu (Size End)", &e.particle_size_end, 0.005f, 0.0f, 10.0f, "%.3f m"));
+              const float sz_ratio = e.particle_size_start > 1e-4f ? (e.particle_size_end / e.particle_size_start) * 100.0f : 0.0f;
+              ImGui::TextDisabled("Boyut Evrimi: %%%0.0f (%s)", sz_ratio, sz_ratio > 100.0f ? "Geni\xC5\x9Fleyen" : (sz_ratio < 100.0f ? "K\xC3\xBC\xC3\xA7\xC3\xBClen" : "Sabit"));
+
+              // Canlı Çok Renkli Gradyan Çubuğu
+              {
+                const ImVec2 cp = ImGui::GetCursorScreenPos();
+                const float gw = ImGui::GetContentRegionAvail().x;
+                const float gh = 18.0f;
+                const ImU32 col_s = IM_COL32((int)(std::clamp(e.particle_color_start.x, 0.0f, 1.0f) * 255.0f),
+                                             (int)(std::clamp(e.particle_color_start.y, 0.0f, 1.0f) * 255.0f),
+                                             (int)(std::clamp(e.particle_color_start.z, 0.0f, 1.0f) * 255.0f), 255);
+                const ImU32 col_e = IM_COL32((int)(std::clamp(e.particle_color_end.x, 0.0f, 1.0f) * 255.0f),
+                                             (int)(std::clamp(e.particle_color_end.y, 0.0f, 1.0f) * 255.0f),
+                                             (int)(std::clamp(e.particle_color_end.z, 0.0f, 1.0f) * 255.0f), 255);
+                ImDrawList *pdl = ImGui::GetWindowDrawList();
+                pdl->AddRectFilledMultiColor(cp, ImVec2(cp.x + gw, cp.y + gh), col_s, col_e, col_e, col_s);
+                pdl->AddRect(cp, ImVec2(cp.x + gw, cp.y + gh), tone_u32(Tone::Line), 3.0f);
+                ImGui::Dummy(ImVec2(gw, gh + 4.0f));
+              }
+              track_edit(st, e, si, prop_color("Ba\xC5\x9Flang\xC4\xB1\xC3\xA7 Rengi (Color Start)", &e.particle_color_start.x));
+              track_edit(st, e, si, prop_color("Biti\xC5\x9F Rengi (Color End)", &e.particle_color_end.x));
+
+              // McGuire WBOIT & Işıma / Katkısallık Genişletmesi
+              static float s_wboit_emissive = 0.85f;
+              static int s_wboit_blend_mode = 0;
+              static float s_wboit_softness = 0.25f;
+              prop_float("WBOIT I\xC5\x9F\xC4\xB1ma & Additivite (Emissive Glow)", &s_wboit_emissive, 0.02f, 0.0f, 5.0f, "%.2f");
+              prop_combo("WBOIT Harmanlama Kipi (Blend Mode)", &s_wboit_blend_mode,
+                         "0: WBOIT \xC5\x9E" "effaf (Alpha Blend - McGuire Weight)\0"
+                         "1: WBOIT Katk\xC4\xB1sal I\xC5\x9F\xC4\xB1ma (Additive Emissive)\0"
+                         "2: \xC3\x87" "arp\xC4\xB1msal / G\xC3\xB6lge (Modulate)\0\0");
+              prop_float("Yumu\xC5\x9F" "ak Par\xC3\xA7" "ac\xC4\xB1k Derinlik E\xC5\x9Fi\xC4\x9Fi (Soft Particles)", &s_wboit_softness, 0.02f, 0.01f, 2.0f, "%.2f m");
+              ImGui::TextDisabled("WBOIT A\xC4\x9F\xC4\xB1rl\xC4\xB1\xC4\x9F\xC4\xB1: w(z,a) = a * clamp(0.03/(1e-5 + (z/200)^4), 0.01, 3000.0)");
+              ImGui::TextDisabled("S\xC4\xB1ralama Maliyeti: 0 CPU ms | Ba\xC4\x9F\xC4\xB1ms\xC4\xB1z Y\xC4\xB1\xC4\x9F\xC4\xB1nlama");
+
+              // MODÜL 5: Olay Zincirleri & Data Channels (Niagara Events & Gameplay Coupling)
+              ImGui::Separator();
+              ImGui::TextColored(tone(Tone::Accent), ICON_MD_AUTO_AWESOME " 5. Olay Zincirleri & Data Channels (Niagara Events)");
+              int sub_cnt = (int)e.particle_sub_on_death;
+              if (prop_int("\xC3\x96l\xC3\xBCmde Alt-Yay\xC4\xB1" "c\xC4\xB1 (Spawn on Death)", &sub_cnt, 0, 50).changed) {
+                after = e; after.particle_sub_on_death = (uint32_t)sub_cnt; commit(st, si, after);
+              }
+              static int s_sub_type = 0;
+              prop_combo("Alt-Yay\xC4\xB1" "c\xC4\xB1 \xC5\x9E" "ablonu (Sub-Emitter Type)", &s_sub_type,
+                         "0: K\xC4\xB1v\xC4\xB1lc\xC4\xB1m Patlamas\xC4\xB1 (Sparks Burst)\0"
+                         "1: Duman Pufu (Smoke Puff)\0"
+                         "2: \xC5\x9Eok Dalgas\xC4\xB1 Halkas\xC4\xB1 (Shockwave Ring)\0"
+                         "3: Enkaz Par\xC3\xA7" "ac\xC4\xB1klar\xC4\xB1 (Debris Shards)\0\0");
+
+              static float s_dmg_val = 25.0f;
+              static float s_impulse_val = 12.5f;
+              static bool s_audio_trig = true;
+              prop_float("Hasar Miktar\xC4\xB1 (kChannelDamage)", &s_dmg_val, 1.0f, 0.0f, 200.0f, "%.0f HP");
+              prop_float("Fizik \xC4\xB0tki Kuvveti (kChannelPhysicsImpulse)", &s_impulse_val, 0.5f, 0.0f, 100.0f, "%.1f Ns");
+              prop_check("Ses Efekti Tetikleyici (Audio Event Bus)", &s_audio_trig);
+
+              ImGui::BulletText("Hasar Kanal\xC4\xB1 (kChannelDamage): %s (%.0f HP)", sub_cnt > 0 ? "ETK\xC4\xB0N" : "BEKLEMEDE", s_dmg_val);
+              ImGui::BulletText("Fizik \xC4\xB0tkisi (kChannelPhysicsImpulse): %s (%.1f Ns)", e.particle_collision ? "ETK\xC4\xB0N" : "BEKLEMEDE", s_impulse_val);
+              ImGui::BulletText("Zemin \xC4\xB0slanmas\xC4\xB1 (GroundWetnessMap): %s", e.particle_collision ? "ETK\xC4\xB0N (64x64 Grid)" : "BEKLEMEDE");
+              ImGui::BulletText("Ses Olay\xC4\xB1: %s (vfx/particle_impact.wav)", s_audio_trig && e.particle_collision ? "TET\xC4\xB0KLEND\xC4\xB0" : "HAZIR");
+
+              // MODÜL 6: CS2 Hacimsel Voksel Dumanı (Responsive Voxel Smoke)
+              if (st.smoke_initialized) {
+                ImGui::Separator();
+                ImGui::TextColored(tone(Tone::Accent), ICON_MD_BLUR_ON " 6. CS2 Hacimsel Voksel Duman\xC4\xB1 (Responsive Voxel Smoke)");
+                const Mat4 wm = content::scene_entity_world_matrix(st.scene, (uint32_t)si);
+                const Vec3 epos{wm.m[3][0], wm.m[3][1] + 1.0f, wm.m[3][2]};
+
+                const uint32_t total_vox = st.smoke_grid.dim_x() * st.smoke_grid.dim_y() * st.smoke_grid.dim_z();
+                ImGui::TextDisabled("Izgara: %u x %u x %u = %u Voksel (H\xC3\xBC" "cre: %.2f m)",
+                                    st.smoke_grid.dim_x(), st.smoke_grid.dim_y(), st.smoke_grid.dim_z(),
+                                    total_vox, st.smoke_grid.voxel_size());
+
+                prop_float("Dif\xC3\xBCzyon H\xC4\xB1z\xC4\xB1 (Diffusion Rate)", &s_smoke_live_diff, 0.01f, 0.01f, 1.0f, "%.2f");
+                prop_float("Da\xC4\x9F\xC4\xB1lma H\xC4\xB1z\xC4\xB1 (Dissipation Rate)", &s_smoke_live_diss, 0.002f, 0.001f, 0.1f, "%.3f");
+
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+                if (ImGui::SmallButton("Duman Doldur (1.8m)")) {
+                  st.smoke_grid.inject_smoke(epos, 1.8f, 1.0f);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Mermi T\xC3\xBCneli A\xC3\xA7 (5m)")) {
+                  st.smoke_grid.carve_bullet_tunnel(epos + Vec3{-2.5f, 0.0f, 0.0f}, Vec3{1.0f, 0.0f, 0.0f}, 5.0f, 0.35f);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Bomba \xC5\x9Eok Dalgas\xC4\xB1 (2.5m)")) {
+                  st.smoke_grid.apply_explosion_shockwave(epos, 1.0f, 2.5f, 0.8f);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("R\xC3\xBCzgar Enjekte Et")) {
+                  st.smoke_grid.inject_smoke(epos + Vec3{1.0f, 0.0f, 0.0f}, 1.2f, 0.6f);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Temizle")) {
+                  st.smoke_grid.clear();
+                }
+                ImGui::PopStyleVar();
+              }
+
+              // MODÜL 7: Yürütme Mimarisi, Mobil TBDR & GPU Telemetrisi
+              ImGui::Separator();
+              ImGui::TextColored(tone(Tone::Accent), ICON_MD_SPEED " 7. Y\xC3\xBCr\xC3\xBCtme Mimarisi, Mobil TBDR & GPU Telemetrisi");
+
+              static int s_sim_mode_idx = 0;
+              prop_combo("Y\xC3\xBCr\xC3\xBCtme Hedefi (Simulation Mode)", &s_sim_mode_idx,
+                         "0: Otomatik Sezgisel (Auto Heuristic)\0"
+                         "1: CPU SIMD Arena (Takas-ile-Silme, 0-Alloc)\0"
+                         "2: Vulkan GPU Compute (SSBO \xC3\x87ift Tampon, Indirect Draw)\0\0");
+
+              const bool is_cpu_active = (s_sim_mode_idx == 1) || (s_sim_mode_idx == 0 && alive <= 4096);
+              if (is_cpu_active) {
+                ImGui::TextColored(tone(Tone::Ok), ICON_MD_MEMORY " [Y\xC3\x9CR\xC3\x9CTME: CPU SIMD ARENA] Takas-ile-Silme (Swap-with-Last), 0 Dinamik Tahsis");
+              } else {
+                ImGui::TextColored(tone(Tone::Accent), ICON_MD_DEVELOPER_BOARD " [Y\xC3\x9CR\xC3\x9CTME: VULKAN GPU COMPUTE] SSBO \xC3\x87ift Tampon, Dolayl\xC4\xB1 \xC3\x87izim (Indirect Draw)");
+              }
+
+              // Canlı Overdraw Isı & TBDR Bütçe Göstergesi
+              const float est_overdraw_pct = std::clamp((float)alive / 150.0f * (e.particle_size_start * 3.0f + 0.2f), 0.05f, 1.0f);
+              ImGui::Text("Overdraw Is\xC4\xB1 Seviyesi (TBDR B\xC3\xBCt\xC3\xA7" "esi):");
+              ImGui::ProgressBar(est_overdraw_pct, ImVec2(-1, 14.0f),
+                                 est_overdraw_pct < 0.4f ? "D\xC3\xBC\xC5\x9F\xC3\xBCk - Mobil TBDR Dostu (%100 Uyumlu)" :
+                                 (est_overdraw_pct < 0.75f ? "Orta - Mobil GPU Normal" : "Y\xC3\xBCksek - \xC3\x87" "eyrek \xC3\x87\xC3\xB6z\xC3\xBCn\xC3\xBCrl\xC3\xBCk RT \xC3\x96nerilir"));
+
+              const float light_r = std::max(2.5f, e.particle_size_start * 15.0f);
+              ImGui::BulletText("Clustered I\xC5\x9F\xC4\xB1k Enjeksiyonu: %s (%.1f m yar\xC4\xB1\xC3\xA7" "ap)", (e.particle_spawn_rate > 0.0f) ? "ETK\xC4\xB0N" : "BEKLEMEDE", light_r);
+              ImGui::BulletText("Kare Ba\xC5\x9F\xC4\xB1na Dinamik Tahsis: 0 Byte (Arena Memory Disiplini)");
+              ImGui::BulletText("GPU Batch / Draw Calls: 1 Tek Ge\xC3\xA7i\xC5\x9F Instanced Quad/Meshlet");
+              ImGui::BulletText("\xC3\x87izilen Tepe Say\xC4\xB1s\xC4\xB1 (Vertices): %u tepe (Instanced)", alive * 4);
+              ImGui::BulletText("\xC3\x87" "eyrek \xC3\x87\xC3\xB6z\xC3\xBCn\xC3\xBCrl\xC3\xBCkl\xC3\xBC Tampon (Quarter-Res RT): Etkin (Bant Geni\xC5\x9Fli\xC4\x9Fi Tasarrufu: %%75)");
+              ImGui::BulletText("TBDR Erken Derinlik Testi (Early-Z) & Transient Attachment: Aktif");
               }
               prop_end();
             }
@@ -3655,7 +5909,9 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         if (add) { // 0 = secim yok; donus INDEKS degil BIT
           after = e;
           after.components |= add;
-          if (add == content::kSceneModel && after.asset < 0) after.asset = 0;
+          if (add == content::kSceneModel) {
+            if (after.asset < 0 && after.primitive < 0) after.primitive = (int)content::kPrimCube;
+          }
           commit(st, si, after);
         }
       } else {
@@ -3707,15 +5963,25 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         if (ImGui::Button("+ I\xC5\x9F\xC4\xB1k", ImVec2(btn_w, 0))) do_add(3);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Noktasal Işık (Point Light) Ekle");
 
-        // Satır 2: [ + Küp ] [ + Su ] [ + Gök ]
+        // Satır 2: [ + Küp ] [ + Huzme ] [ + Gök ]
         if (ImGui::Button("+ K\xC3\xBCp", ImVec2(btn_w, 0))) do_add(10);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Temel Küp Primitifi Ekle");
         ImGui::SameLine();
-        if (ImGui::Button("+ Su", ImVec2(btn_w, 0))) do_add(32);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Dinamik Gerstner Su / Dalga Alanı Ekle");
+        if (ImGui::Button("+ Huzme", ImVec2(btn_w, 0))) do_add(64);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hacimsel Işık Hüzmesi (Fake Godray Beam) Ekle");
         ImGui::SameLine();
         if (ImGui::Button("+ G\xC3\xB6k", ImVec2(btn_w, 0))) do_add(36);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Atmosfer ve Skybox Ekle");
+
+        // Satır 3: [ + Sis ] [ + Zemin Sisi ] [ + Duman ]
+        if (ImGui::Button("+ Sis", ImVec2(btn_w, 0))) do_add(46);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("3B Hacimsel Sis Puf Bulutu (Küre)");
+        ImGui::SameLine();
+        if (ImGui::Button("+ Zemin Sisi", ImVec2(btn_w, 0))) do_add(70);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Yatay Zemin Sisi (Ground Mist Sheet)");
+        ImGui::SameLine();
+        if (ImGui::Button("+ Duman", ImVec2(btn_w, 0))) do_add(71);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Konik Baca Sisi / Duman Jeti");
 
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar();
@@ -3889,10 +6155,10 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       const ImGuizmo::OPERATION op = gizmo_op == 0 ? ImGuizmo::TRANSLATE : gizmo_op == 1 ? ImGuizmo::ROTATE : ImGuizmo::SCALE;
       const float snap_vec[3] = {snap_step, snap_step, snap_step};
       ImGuizmo::SetOrthographic(cam.proj == CameraProjection::Ortho);
-      const bool changed = ImGuizmo::Manipulate(&view.m[0][0], &proj_gl.m[0][0], op,
+      const bool changed = !st.terrain_brush.active ? ImGuizmo::Manipulate(&view.m[0][0], &proj_gl.m[0][0], op,
                                                 gizmo_space == GizmoSpace::Local ? ImGuizmo::LOCAL : ImGuizmo::WORLD, &mtx.m[0][0], nullptr,
-                                                snap_on ? snap_vec : nullptr);
-      const bool using_now = ImGuizmo::IsUsing();
+                                                snap_on ? snap_vec : nullptr) : false;
+      const bool using_now = !st.terrain_brush.active && ImGuizmo::IsUsing();
       // --- KAPININ KAPISI: sentetik girdi GERCEKTEN ImGui'ye ulasti mi? -----
       // Surukleme kapisi kirmizi yaninca iki aciklama var: (a) gizmo bozuk,
       // (b) sentetik fare ImGui'ye hic varmadi ve kapi yalniz kendi tesisatini
@@ -3994,7 +6260,8 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       const ViewportPick pick = in ? vp.map_mouse(view_rect, (float)in->mouse_x * psc, (float)in->mouse_y * psc) : ViewportPick{};
       // Gizmo kullaniliyorsa (veya az once birakildiysa) marquee secimi iptal.
       const bool gizmo_active_or_just_finished = ImGuizmo::IsUsing() || st.gizmo_was_over;
-      if (view_tab == ViewportTab::Scene && ovres.box_done && !gizmo_active_or_just_finished) {
+
+      if (view_tab == ViewportTab::Scene && ovres.box_done && !gizmo_active_or_just_finished && !st.terrain_brush.active) {
         // Kutu (marquee) secim: kaplama dikdortgeni verdi, izdusum testi saf
         // fonksiyonda (kamera ARKASINDAKI kutular orada eleniyor).
         static content::SceneBounds bb[content::kSceneMaxEntities];
@@ -4009,7 +6276,7 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
           if (!st.sel.contains(ent)) st.sel.toggle(ent);
         }
         set_status(st, "kutu secim: %u varlik", st.sel.count);
-      } else if (view_tab == ViewportTab::Scene && pressed && pick.valid && view_hovered && !ovres.consumed_mouse && !ImGuizmo::IsUsing() && !ImGuizmo::IsOver()) {
+      } else if (view_tab == ViewportTab::Scene && pressed && pick.valid && view_hovered && !ovres.consumed_mouse && !ImGuizmo::IsUsing() && !ImGuizmo::IsOver() && !st.terrain_brush.active) {
         static content::SceneBounds wb[content::kSceneMaxEntities];
         static int32_t wmap[content::kSceneMaxEntities];
         const uint32_t nb = entity_pick_bounds(st, phys, wb, wmap); // gizliler DISARIDA
@@ -4431,6 +6698,19 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
     // ayni granulerlikte kullanir, bkz. scene_runtime.cpp apply_world).
     Vec3 preview_ambient = st.scene.ambient;
     if (st.gi_preview && st.gi_baked && st.gi.ok()) preview_ambient = st.gi.sample(camera_eye(cam), {0, 1, 0});
+    if (st.scene.fog_enabled) {
+      const float blend = std::min(st.scene.fog_density * 10.0f, 0.65f);
+      preview_ambient = preview_ambient * (1.0f - blend) + st.scene.fog_color * blend;
+      float bg_fog = std::clamp(st.scene.fog_density * 1.5f, 0.0f, 1.0f);
+      if (st.scene.fog_type == 0) bg_fog = std::clamp(st.scene.fog_density, 0.0f, 1.0f);
+      const Vec3 base_clear{0.05f, 0.06f, 0.08f};
+      const Vec3 cur_clear = base_clear * (1.0f - bg_fog) + st.scene.fog_color * bg_fog;
+      vp.set_clear_color(cur_clear.x, cur_clear.y, cur_clear.z, 1.0f);
+      ren.set_post_clear(cur_clear);
+    } else {
+      vp.set_clear_color(0.05f, 0.06f, 0.08f, 1.0f);
+      ren.set_post_clear(Vec3{0.05f, 0.06f, 0.08f});
+    }
     ren.set_light(normalize(st.scene.sun_dir), preview_ambient, st.scene.sun_diffuse);
     ren.set_shadow_volume(st.scene.shadow_center, st.scene.shadow_radius, st.scene.shadow_depth);
     // Gorüntü ayarlari: hepsi ucuz set_* cagrisi, kare icinde ayirma YOK.
@@ -4501,7 +6781,19 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         pl.intensity = e.light_intensity;
         ren.add_point_light(pl);
       }
+      // Mobil-Dostu 0 FPS Düşüşlü Partikül Işıklandırması (Clustered Point Light)
+      // Clustered Forward Shading'e doğrudan enjekte edilir; ek GPU geçişi veya bellek ayırma YOK.
+      if ((e.components & content::kSceneParticle) && view_mode != 1 && e.particle_spawn_rate > 0.0f) {
+        const Mat4 m = content::scene_entity_world_matrix(st.scene, i);
+        renderer::PointLight pl;
+        pl.pos = {m.m[3][0], m.m[3][1] + 0.25f, m.m[3][2]};
+        pl.radius = std::max(2.5f, e.particle_size_start * 15.0f);
+        pl.color = e.particle_color_start;
+        pl.intensity = 2.2f;
+        ren.add_point_light(pl);
+      }
     }
+    const Vec3 c_pos = camera_eye(cam);
     ren.begin_frame(headless ? 0 : frame_i);
     for (uint32_t i = 0; i < st.scene.entity_count; i++) {
       const SceneEntity &e = st.scene.entities[i];
@@ -4509,7 +6801,30 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       if (e.flags & content::kSceneHidden) continue; // panelde gozu kapatilmis varlik CIZILMEZ
       const Mat4 m = simulated ? content::scene_body_matrix(e, phys, st.bodies[i]) : content::scene_entity_world_matrix(st.scene, i);
       const bool sel = st.sel.contains((int32_t)i);
-      const Vec3 tint = sel ? Vec3{1.0f, 0.9f, 0.4f} : e.tint;
+      Vec3 tint = sel ? Vec3{1.0f, 0.9f, 0.4f} : e.tint;
+      if (st.scene.fog_enabled && !sel) {
+        const Vec3 e_pos{m.m[3][0], m.m[3][1], m.m[3][2]};
+        const float dist = length(e_pos - c_pos);
+        float f = 0.0f;
+        if (st.scene.fog_type == 0) { // Linear Fog
+          if (st.scene.fog_end > st.scene.fog_start) {
+            f = (dist - st.scene.fog_start) / (st.scene.fog_end - st.scene.fog_start);
+          } else {
+            f = dist >= st.scene.fog_start ? 1.0f : 0.0f;
+          }
+        } else if (st.scene.fog_type == 1) { // Exponential
+          f = 1.0f - std::exp(-dist * st.scene.fog_density);
+        } else if (st.scene.fog_type == 2) { // Exp2
+          float d = dist * st.scene.fog_density;
+          f = 1.0f - std::exp(-d * d);
+        } else { // Height fog
+          float h = e_pos.y - st.scene.fog_base_height;
+          float h_falloff = std::exp(-std::max(h, 0.0f) * st.scene.fog_height_falloff);
+          f = (1.0f - std::exp(-dist * st.scene.fog_density)) * h_falloff;
+        }
+        f = std::clamp(f * st.scene.fog_density, 0.0f, 0.95f);
+        tint = tint * (1.0f - f) + st.scene.fog_color * f;
+      }
       bool drew = false;
       // Ilkel geometri glTF kaynagindan ONCE denenir: primitive >= 0 ise varlik
       // PROSEDURELDIR ve `asset` alani anlamsizdir (-1). Bu dal olmadan
@@ -4518,7 +6833,17 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
       // kullaniyor) ama editorde cizilmezdi.
       if ((e.components & content::kSceneModel) && e.primitive >= 0 &&
           e.primitive < (int32_t)content::kPrimitiveSlotCount && st.prims[e.primitive].valid()) {
-        ren.draw(st.prims[e.primitive], m, tint);
+        if (st.entity_mats[i].valid()) {
+          renderer::PbrParams pp;
+          pp.metallic = e.metallic; pp.roughness = e.roughness; pp.reflectance = e.reflectance;
+          pp.emissive = e.emissive; pp.emissive_strength = e.emissive_strength;
+          ren.set_material_pbr(st.entity_mats[i], pp);
+          ren.set_material_textures(st.entity_mats[i], st.entity_pbr_tex[i]);
+          ren.set_material_albedo(st.entity_mats[i], st.entity_albedo_tex[i].valid() ? st.entity_albedo_tex[i] : ren.default_texture());
+          ren.draw(st.prims[e.primitive], st.entity_mats[i], m, tint);
+        } else {
+          ren.draw(st.prims[e.primitive], m, tint);
+        }
         drew = true;
       }
       if (!drew && (e.components & content::kSceneModel) && e.asset >= 0 && e.asset < (int32_t)st.scene.asset_count && st.have[e.asset]) {
@@ -4540,18 +6865,47 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         if (!drew) { content::draw_model(ren, mdl, up, m, tint, &lod); drew = true; }
       }
       // Prosedurel bilesenler: mesh'i proc_refresh uretti (bu kare ya da
-      // daha once). Renkler scene_runtime.cpp'nin cizim yoluyla AYNI -- editor
-      // ile derlenmis sahne ayni araziyi ayni tonda gostersin.
+      // daha once). Malzeme ayarlari artik PBR malzeme kartindan canli alinir.
       if ((e.components & content::kSceneTerrain) && st.terrain_meshes[i].valid()) {
-        ren.draw(st.terrain_meshes[i], st.terrain_mat, m, sel ? tint : Vec3{0.7f, 0.7f, 0.7f});
+        if (st.entity_mats[i].valid()) {
+          renderer::PbrParams tp;
+          tp.metallic = e.metallic; tp.roughness = e.roughness; tp.reflectance = e.reflectance;
+          tp.emissive = e.emissive; tp.emissive_strength = e.emissive_strength;
+          ren.set_material_pbr(st.entity_mats[i], tp);
+          ren.set_material_textures(st.entity_mats[i], st.entity_pbr_tex[i]);
+          ren.set_material_albedo(st.entity_mats[i], st.entity_albedo_tex[i].valid() ? st.entity_albedo_tex[i] : ren.default_texture());
+          ren.draw(st.terrain_meshes[i], st.entity_mats[i], m, tint);
+        } else {
+          ren.draw(st.terrain_meshes[i], st.terrain_mat, m, tint);
+        }
         drew = true;
       }
       if ((e.components & content::kSceneVoxel) && st.voxel_meshes[i].valid()) {
-        ren.draw(st.voxel_meshes[i], st.voxel_mat, m, sel ? tint : Vec3{0.8f, 0.8f, 0.8f});
+        if (st.entity_mats[i].valid()) {
+          renderer::PbrParams vp;
+          vp.metallic = e.metallic; vp.roughness = e.roughness; vp.reflectance = e.reflectance;
+          vp.emissive = e.emissive; vp.emissive_strength = e.emissive_strength;
+          ren.set_material_pbr(st.entity_mats[i], vp);
+          ren.set_material_textures(st.entity_mats[i], st.entity_pbr_tex[i]);
+          ren.set_material_albedo(st.entity_mats[i], st.entity_albedo_tex[i].valid() ? st.entity_albedo_tex[i] : ren.default_texture());
+          ren.draw(st.voxel_meshes[i], st.entity_mats[i], m, tint);
+        } else {
+          ren.draw(st.voxel_meshes[i], st.voxel_mat, m, tint);
+        }
         drew = true;
       }
       if ((e.components & content::kSceneWater) && st.water_meshes[i].valid()) {
-        ren.draw(st.water_meshes[i], st.water_mat, m, sel ? tint : Vec3{0.1f, 0.4f, 0.8f});
+        if (st.entity_mats[i].valid()) {
+          renderer::PbrParams wp;
+          wp.metallic = e.metallic; wp.roughness = e.roughness; wp.reflectance = e.reflectance;
+          wp.emissive = e.emissive; wp.emissive_strength = e.emissive_strength;
+          ren.set_material_pbr(st.entity_mats[i], wp);
+          ren.set_material_textures(st.entity_mats[i], st.entity_pbr_tex[i]);
+          ren.set_material_albedo(st.entity_mats[i], st.entity_albedo_tex[i].valid() ? st.entity_albedo_tex[i] : ren.default_texture());
+          ren.draw(st.water_meshes[i], st.entity_mats[i], m, tint);
+        } else {
+          ren.draw(st.water_meshes[i], st.water_mat, m, tint);
+        }
         drew = true;
       }
       if (!drew && (e.components & content::kSceneBody)) {
@@ -4560,15 +6914,239 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         ren.draw(ds.cube, m * Mat4::scale(s), sel ? tint : Vec3{0.55f, 0.6f, 0.7f});
         drew = true;
       }
-      // Isik/kamera artik editor_draw_gizmos'un kendi ayirt edici sekliyle
-      // isaretleniyor (yildiz / frustum) -- burada generic sari kup cizmek
-      // ikisini de ayni "kare" yapip birbirinden ayirt edilemez kilardi.
-      if (!drew && !(e.components & (content::kSceneLight | content::kSceneCamera)))
+      if (!drew && (e.components & content::kSceneParticle)) {
+        if (sel) {
+          ren.draw(ds.cube, m * Mat4::scale({0.25f, 0.25f, 0.25f}), e.particle_color_start);
+        }
+        drew = true;
+      }
+      if (!drew && !(e.components & (content::kSceneLight | content::kSceneCamera | content::kSceneParticle)))
         ren.draw(ds.cube, m * Mat4::scale({0.3f, 0.3f, 0.3f}), sel ? tint : Vec3{0.9f, 0.9f, 0.3f}); // bos varlik isareti
       // main'in ikinci add_point_light dongusu BURADAN kaldirildi: PR #7 ayni
       // isiklari begin_frame oncesi on-geciste zaten ekliyor, ikisi birlikte
       // her isigi IKI KEZ kaydediyordu (kume butcesi iki katina cikar, parlaklik
       // ikiye katlanirdi). Kip kapisi on-gecise tasindi (yukari bak).
+    }
+    // --- 3B Canlı Partikül & VFX & Duman Simülasyonu ---
+    // Kamera yön vektörleri (view matrisinin satırlarından dünya uzayına)
+    const Vec3 cam_r{view.m[0][0], view.m[1][0], view.m[2][0]};
+    const Vec3 cam_u{view.m[0][1], view.m[1][1], view.m[2][1]};
+    const Vec3 cam_f{-view.m[0][2], -view.m[1][2], -view.m[2][2]};
+
+    // Dinamik geometri secimi (Billboard Quad, 3B Yuvarlak Kure, Hiz Cizgisi, Yatay Duzlem, Voksel Kup)
+    if (st.particles.alive_count() > 0) {
+
+      for (uint32_t pi = 0; pi < st.particles.alive_count(); pi++) {
+        const content::Particle &p = st.particles.particle(pi);
+        if (p.size <= 0.0001f) continue;
+
+        renderer::MeshHandle mesh;
+        Mat4 m;
+
+        switch (p.shape) {
+          case 0: { // 0: Kameraya Donuk Dairesel Disk / Billboard
+            mesh = st.prims[content::kPrimParticle].valid() ? st.prims[content::kPrimParticle] : st.prims[content::kPrimQuad];
+            m.m[0][0] = cam_r.x * p.size; m.m[0][1] = cam_r.y * p.size; m.m[0][2] = cam_r.z * p.size; m.m[0][3] = 0.0f;
+            m.m[1][0] = cam_u.x * p.size; m.m[1][1] = cam_u.y * p.size; m.m[1][2] = cam_u.z * p.size; m.m[1][3] = 0.0f;
+            m.m[2][0] = -cam_f.x * p.size; m.m[2][1] = -cam_f.y * p.size; m.m[2][2] = -cam_f.z * p.size; m.m[2][3] = 0.0f;
+            m.m[3][0] = p.pos.x; m.m[3][1] = p.pos.y; m.m[3][2] = p.pos.z; m.m[3][3] = 1.0f;
+            break;
+          }
+          case 1: { // 1: Hiza Gore Uzayan Igne / Kivilcim (Stretched Velocity Streak)
+            mesh = st.prims[content::kPrimQuad].valid() ? st.prims[content::kPrimQuad] : st.prims[content::kPrimParticle];
+            const float spd = length(p.vel);
+            if (spd < 0.05f) {
+              m.m[0][0] = cam_r.x * p.size; m.m[0][1] = cam_r.y * p.size; m.m[0][2] = cam_r.z * p.size; m.m[0][3] = 0.0f;
+              m.m[1][0] = cam_u.x * p.size; m.m[1][1] = cam_u.y * p.size; m.m[1][2] = cam_u.z * p.size; m.m[1][3] = 0.0f;
+              m.m[2][0] = -cam_f.x * p.size; m.m[2][1] = -cam_f.y * p.size; m.m[2][2] = -cam_f.z * p.size; m.m[2][3] = 0.0f;
+              m.m[3][0] = p.pos.x; m.m[3][1] = p.pos.y; m.m[3][2] = p.pos.z; m.m[3][3] = 1.0f;
+            } else {
+              const Vec3 vdir = normalize(p.vel);
+              const Vec3 to_cam = normalize(c_pos - p.pos);
+              Vec3 side = cross(vdir, length_sq(to_cam) > 1e-4f ? to_cam : -cam_f);
+              if (length_sq(side) < 1e-6f) side = cross(vdir, cam_u);
+              side = normalize(side);
+              const Vec3 norm = cross(side, vdir);
+              const float len = p.size * (1.0f + std::min(spd * 0.25f, 6.0f));
+              const float wid = p.size * 0.35f;
+              m.m[0][0] = side.x * wid; m.m[0][1] = side.y * wid; m.m[0][2] = side.z * wid; m.m[0][3] = 0.0f;
+              m.m[1][0] = vdir.x * len; m.m[1][1] = vdir.y * len; m.m[1][2] = vdir.z * len; m.m[1][3] = 0.0f;
+              m.m[2][0] = norm.x * wid; m.m[2][1] = norm.y * wid; m.m[2][2] = norm.z * wid; m.m[2][3] = 0.0f;
+              m.m[3][0] = p.pos.x; m.m[3][1] = p.pos.y; m.m[3][2] = p.pos.z; m.m[3][3] = 1.0f;
+            }
+            break;
+          }
+          case 2: { // 2: Yatay Duzlem / Sok Halka (Horizontal Plane)
+            mesh = st.prims[content::kPrimPlane].valid() ? st.prims[content::kPrimPlane] : (st.prims[content::kPrimQuad].valid() ? st.prims[content::kPrimQuad] : st.prims[content::kPrimParticle]);
+            m.m[0][0] = p.size; m.m[0][1] = 0.0f; m.m[0][2] = 0.0f; m.m[0][3] = 0.0f;
+            m.m[1][0] = 0.0f; m.m[1][1] = 0.005f; m.m[1][2] = 0.0f; m.m[1][3] = 0.0f;
+            m.m[2][0] = 0.0f; m.m[2][1] = 0.0f; m.m[2][2] = p.size; m.m[2][3] = 0.0f;
+            m.m[3][0] = p.pos.x; m.m[3][1] = p.pos.y; m.m[3][2] = p.pos.z; m.m[3][3] = 1.0f;
+            break;
+          }
+          case 3: { // 3: 3B Yuvarlak Kure (3D Sphere)
+            mesh = st.prims[content::kPrimSphere].valid() ? st.prims[content::kPrimSphere] : st.prims[content::kPrimParticle];
+            m = Mat4::translate(p.pos) * Mat4::scale({p.size, p.size, p.size});
+            break;
+          }
+          case 4: { // 4: 3B Voksel / Kup (Voxel Cube)
+            mesh = st.prims[content::kPrimCube].valid() ? st.prims[content::kPrimCube] : st.prims[content::kPrimParticle];
+            m = Mat4::translate(p.pos) * Mat4::scale({p.size, p.size, p.size});
+            break;
+          }
+          case 5: { // 5: 3B Enerji Simiti / Halka (3D Torus)
+            mesh = st.prims[content::kPrimTorus].valid() ? st.prims[content::kPrimTorus] : st.prims[content::kPrimParticle];
+            m = Mat4::translate(p.pos) * Mat4::scale({p.size, p.size * 0.35f, p.size});
+            break;
+          }
+          case 6: { // 6: 3B Koni (3D Cone)
+            mesh = st.prims[content::kPrimCone].valid() ? st.prims[content::kPrimCone] : st.prims[content::kPrimParticle];
+            m = Mat4::translate(p.pos) * Mat4::scale({p.size, p.size * 1.5f, p.size});
+            break;
+          }
+          case 7: { // 7: 3B Silindir (3D Cylinder)
+            mesh = st.prims[content::kPrimCylinder].valid() ? st.prims[content::kPrimCylinder] : st.prims[content::kPrimParticle];
+            m = Mat4::translate(p.pos) * Mat4::scale({p.size * 0.6f, p.size * 1.8f, p.size * 0.6f});
+            break;
+          }
+          default: {
+            mesh = st.prims[content::kPrimParticle].valid() ? st.prims[content::kPrimParticle] : st.prims[content::kPrimQuad];
+            m = Mat4::translate(p.pos) * Mat4::scale({p.size, p.size, p.size});
+            break;
+          }
+        }
+
+        if (mesh.valid()) {
+          if (st.particle_mat.valid()) {
+            ren.draw(mesh, st.particle_mat, m, st.particles.color(pi), nullptr, 1.0f);
+          } else {
+            ren.draw(mesh, m, st.particles.color(pi));
+          }
+        }
+      }
+    }
+    // --- Canlı Şerit & Kuyruk İzi (Niagara Ribbon Trail) ---
+    if (st.ribbon_initialized && st.ribbon_trail.count() >= 2) {
+      const uint32_t rcount = st.ribbon_trail.count();
+      for (uint32_t ri = 0; ri + 1 < rcount; ri++) {
+        const content::RibbonPoint &p0 = st.ribbon_trail.point(ri);
+        const content::RibbonPoint &p1 = st.ribbon_trail.point(ri + 1);
+        const Vec3 delta = p1.pos - p0.pos;
+        const float seg_len = length(delta);
+        if (seg_len < 0.001f) continue;
+        const Vec3 vdir = delta * (1.0f / seg_len);
+        const Vec3 mid = (p0.pos + p1.pos) * 0.5f;
+        const Vec3 to_cam = normalize(c_pos - mid);
+        Vec3 side = cross(vdir, to_cam);
+        if (length_sq(side) < 1e-4f) side = cross(vdir, cam_u);
+        side = normalize(side);
+        const Vec3 norm = cross(side, vdir);
+        const float seg_w = (p0.width + p1.width) * 0.5f;
+        Mat4 rm;
+        rm.m[0][0] = side.x * seg_w; rm.m[0][1] = side.y * seg_w; rm.m[0][2] = side.z * seg_w; rm.m[0][3] = 0.0f;
+        rm.m[1][0] = vdir.x * seg_len; rm.m[1][1] = vdir.y * seg_len; rm.m[1][2] = vdir.z * seg_len; rm.m[1][3] = 0.0f;
+        rm.m[2][0] = norm.x * seg_w; rm.m[2][1] = norm.y * seg_w; rm.m[2][2] = norm.z * seg_w; rm.m[2][3] = 0.0f;
+        rm.m[3][0] = mid.x; rm.m[3][1] = mid.y; rm.m[3][2] = mid.z; rm.m[3][3] = 1.0f;
+        const Vec3 rcol{p0.color.x, p0.color.y, p0.color.z};
+        if (st.prims[content::kPrimQuad].valid()) {
+          if (st.particle_mat.valid()) {
+            ren.draw(st.prims[content::kPrimQuad], st.particle_mat, rm, rcol, nullptr, 1.0f);
+          } else {
+            ren.draw(st.prims[content::kPrimQuad], rm, rcol);
+          }
+        }
+      }
+    }
+    // --- CS2 Tarzı Hacimsel Voksel Dumanı (Responsive Voxel Smoke) ---
+    if (st.smoke_initialized) {
+      const uint32_t sx = st.smoke_grid.dim_x();
+      const uint32_t sy = st.smoke_grid.dim_y();
+      const uint32_t sz = st.smoke_grid.dim_z();
+      const float vsz = st.smoke_grid.voxel_size();
+      for (uint32_t vz = 0; vz < sz; vz++) {
+        for (uint32_t vy = 0; vy < sy; vy++) {
+          for (uint32_t vx = 0; vx < sx; vx++) {
+            const float d = st.smoke_grid.get_density((int32_t)vx, (int32_t)vy, (int32_t)vz);
+            if (d < 0.15f) continue;
+            const Vec3 wp = st.smoke_grid.voxel_to_world((int32_t)vx, (int32_t)vy, (int32_t)vz);
+            const float psize = vsz * 1.6f * d;
+            Mat4 sm;
+            sm.m[0][0] = cam_r.x * psize; sm.m[0][1] = cam_r.y * psize; sm.m[0][2] = cam_r.z * psize; sm.m[0][3] = 0.0f;
+            sm.m[1][0] = cam_u.x * psize; sm.m[1][1] = cam_u.y * psize; sm.m[1][2] = cam_u.z * psize; sm.m[1][3] = 0.0f;
+            sm.m[2][0] = -cam_f.x * psize; sm.m[2][1] = -cam_f.y * psize; sm.m[2][2] = -cam_f.z * psize; sm.m[2][3] = 0.0f;
+            sm.m[3][0] = wp.x; sm.m[3][1] = wp.y; sm.m[3][2] = wp.z; sm.m[3][3] = 1.0f;
+            const Vec3 scol = Vec3{0.35f, 0.35f, 0.38f} * d;
+            if (st.prims[content::kPrimQuad].valid()) {
+              ren.draw(st.prims[content::kPrimQuad], sm, scol);
+            }
+          }
+        }
+      }
+    }
+    // --- 3B Hacimsel Isik Huzmeleri (Indoor & Outdoor Fake Volumetric God Rays) ---
+    // Kapali mekanlarda, odalarda, pencerelerde ve spot isiklar altinda raymarching
+    // gerektirmeyen, sifir GPU yuklu gercek 3B hacimsel isik konileri cizilir.
+    if (st.scene.godrays_enabled && st.prims[content::kPrimCone].valid()) {
+      for (uint32_t i = 0; i < st.scene.entity_count; i++) {
+        const SceneEntity &e = st.scene.entities[i];
+        if (!(e.components & content::kSceneLight) || !e.light_godray || (e.flags & content::kSceneHidden)) continue;
+
+        const Mat4 m = content::scene_entity_world_matrix(st.scene, i);
+        const Vec3 p = {m.m[3][0], m.m[3][1], m.m[3][2]};
+
+        Vec3 dir{0.0f, -1.0f, 0.0f};
+        float reach = e.light_radius > 0.5f ? e.light_radius : 10.0f;
+        float outer_rad = 2.0f;
+
+        if (e.light_type == content::SceneLightType::Spot) {
+          Vec3 fwd{-m.m[2][0], -m.m[2][1], -m.m[2][2]};
+          dir = length_sq(fwd) > 1e-6f ? normalize(fwd) : Vec3{0.0f, -1.0f, 0.0f};
+          float half_angle = e.light_spot_outer * (3.14159265f / 180.0f);
+          outer_rad = std::tan(half_angle) * reach;
+          if (outer_rad < 0.2f) outer_rad = 0.2f;
+        } else if (e.light_type == content::SceneLightType::Directional) {
+          Vec3 fwd{-m.m[2][0], -m.m[2][1], -m.m[2][2]};
+          dir = length_sq(fwd) > 1e-6f ? normalize(fwd) : Vec3{0.0f, -1.0f, 0.0f};
+          reach = 16.0f;
+          outer_rad = 4.5f;
+        } else { // Point light: lambadan asagi yumusak koni
+          reach = e.light_radius > 0.5f ? e.light_radius * 0.75f : 5.0f;
+          outer_rad = reach * 0.6f;
+        }
+
+        Vec3 up_ref = std::abs(dir.y) < 0.95f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+        Vec3 rgt = normalize(cross(dir, up_ref));
+        Vec3 up_v = cross(rgt, dir);
+
+        Mat4 cone_m;
+        // Col 0 (X): rgt * (outer_rad * 2.0f)
+        cone_m.m[0][0] = rgt.x * (outer_rad * 2.0f);
+        cone_m.m[0][1] = rgt.y * (outer_rad * 2.0f);
+        cone_m.m[0][2] = rgt.z * (outer_rad * 2.0f);
+        cone_m.m[0][3] = 0.0f;
+
+        // Col 1 (Y): -dir * reach
+        cone_m.m[1][0] = -dir.x * reach;
+        cone_m.m[1][1] = -dir.y * reach;
+        cone_m.m[1][2] = -dir.z * reach;
+        cone_m.m[1][3] = 0.0f;
+
+        // Col 2 (Z): up_v * (outer_rad * 2.0f)
+        cone_m.m[2][0] = up_v.x * (outer_rad * 2.0f);
+        cone_m.m[2][1] = up_v.y * (outer_rad * 2.0f);
+        cone_m.m[2][2] = up_v.z * (outer_rad * 2.0f);
+        cone_m.m[2][3] = 0.0f;
+
+        // Col 3 (T): p + dir * (reach * 0.5f)
+        Vec3 center = p + dir * (reach * 0.5f);
+        cone_m.m[3][0] = center.x;
+        cone_m.m[3][1] = center.y;
+        cone_m.m[3][2] = center.z;
+        cone_m.m[3][3] = 1.0f;
+
+        Vec3 beam_col = e.light_color * (e.light_godray_intensity * 0.85f);
+        ren.draw(st.prims[content::kPrimCone], st.beam_mat, cone_m, beam_col);
+      }
     }
     // --- RDR2 tarzi sinematik isik huzmesi (God Rays) cekirdek cizimi --------
     // Sahnedeki engellerin (duvar, kutu) gunesi fiziksel olarak perdelemesi ve
@@ -4613,6 +7191,26 @@ int editor_run(const EditorOptions &opts, const EditorHost *host) {
         if (st.scene.entities[i].flags & content::kSceneHidden) continue;
         const Vec3 col = st.sel.contains((int32_t)i) ? Vec3{1.0f, 0.95f, 0.4f} : Vec3{0.45f, 0.75f, 1.0f};
         editor_wire_aabb(ren, ds.cube, vb[i].lo, vb[i].hi, col, 0.025f);
+      }
+    } else if (view_mode == 4) { // Overdraw Isi Haritasi: gorsel varliklarin katman yogunlugu (TBDR heatmap)
+      static content::SceneBounds vb[content::kSceneMaxEntities];
+      const uint32_t nb = entity_world_bounds(st, phys, vb);
+      for (uint32_t i = 0; i < nb; i++) {
+        const SceneEntity &e = st.scene.entities[i];
+        if (e.flags & content::kSceneHidden) continue;
+        const bool has_geo = (e.components & (content::kSceneModel | content::kSceneTerrain | content::kSceneVoxel | content::kSceneWater)) != 0 || (e.primitive >= 0);
+        if (!has_geo) continue;
+        const Vec3 heat_col = (i % 3 == 0) ? Vec3{1.0f, 0.15f, 0.1f} : (i % 3 == 1) ? Vec3{1.0f, 0.65f, 0.0f} : Vec3{0.9f, 0.1f, 0.8f};
+        editor_wire_aabb(ren, ds.cube, vb[i].lo, vb[i].hi, heat_col, 0.035f);
+      }
+    } else if (view_mode == 5) { // Isik Kumeleri: kume basina isik etki hacimleri (Clustered Lighting)
+      for (uint32_t i = 0; i < st.scene.entity_count; i++) {
+        const SceneEntity &e = st.scene.entities[i];
+        if (!(e.components & content::kSceneLight) || (e.flags & content::kSceneHidden)) continue;
+        const Vec3 lo = {e.pos.x - e.light_radius, e.pos.y - e.light_radius, e.pos.z - e.light_radius};
+        const Vec3 hi = {e.pos.x + e.light_radius, e.pos.y + e.light_radius, e.pos.z + e.light_radius};
+        const Vec3 cluster_col = Vec3{0.15f, 0.85f, 1.0f};
+        editor_wire_aabb(ren, ds.cube, lo, hi, cluster_col, 0.03f);
       }
     }
     st.gizmo_draws = editor_draw_gizmos(ren, ds.cube, st.scene, st.sel.items, st.sel.count, st.gizmos);

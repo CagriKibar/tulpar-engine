@@ -79,7 +79,8 @@ def read_text(path):
 
 def sha_of(path):
     with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
+        # Satir sonu normalize: Windows checkout'unda autocrlf ozeti bozmasin (GLSL icin CRLF anlamsizdir)
+        return hashlib.sha256(f.read().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def words_from_header(path):

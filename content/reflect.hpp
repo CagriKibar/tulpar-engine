@@ -156,7 +156,14 @@ inline constexpr FieldMeta kParticleFields[] = {
   {"Baslangic Rengi", "##p_cstart", FieldType::Color3, offsetof(content::SceneEntity, particle_color_start), sizeof(Vec3), 0.0f, 1.0f, 0.01f, nullptr, "Dogus rengi (RGB)", nullptr, 1.0f, Vec2{0, 0}, Vec3{1.0f, 0.6f, 0.1f}},
   {"Bitis Rengi", "##p_cend", FieldType::Color3, offsetof(content::SceneEntity, particle_color_end), sizeof(Vec3), 0.0f, 1.0f, 0.01f, nullptr, "Omur sonu rengi (RGB)", nullptr, 0.0f, Vec2{0, 0}, Vec3{0.2f, 0.2f, 0.2f}},
   {"Yercekimi", "##p_grav", FieldType::Float, offsetof(content::SceneEntity, particle_gravity), sizeof(float), -50.0f, 50.0f, 0.1f, "%.1f m/s2", "Parcaciklara uygulanan yercekimi ivmesi", nullptr, -2.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
-  {"Billboard Turu", "##p_bb", FieldType::Enum, offsetof(content::SceneEntity, particle_billboard_type), sizeof(uint32_t), 0.0f, 2.0f, 1.0f, nullptr, "Gorsel yonelim", "Kameraya Donuk\0Hiza Gore Esneyen\0Yatay Duzlem\0\0", 0.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
+  {"Parcacik Sekli", "##p_bb", FieldType::Enum, offsetof(content::SceneEntity, particle_billboard_type), sizeof(uint32_t), 0.0f, 7.0f, 1.0f, nullptr, "Gorsel yonelim ve sekil", "Kameraya Donuk Dortgen\0Hiza Gore Esneyen Igne\0Yatay Duzlem\0Yuvarlak 3B Kure\0Voksel 3B Kup\0" "3B Enerji Simiti (Torus)\0" "3B Koni (Cone)\0" "3B Silindir (Cylinder)\0\0", 0.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
+  {"Turbulans Gucu", "##p_curl", FieldType::Float, offsetof(content::SceneEntity, particle_curl_strength), sizeof(float), 0.0f, 50.0f, 0.1f, "%.1f", "Curl noise akiskan turbulans ivmesi", nullptr, 0.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
+  {"Turbulans Frekansi", "##p_cfreq", FieldType::Float, offsetof(content::SceneEntity, particle_curl_freq), sizeof(float), 0.01f, 10.0f, 0.05f, "%.2f", "Uzamsal gurultu olcegi", nullptr, 1.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
+  {"Hava Direnci", "##p_drag", FieldType::Float, offsetof(content::SceneEntity, particle_drag), sizeof(float), 0.0f, 10.0f, 0.01f, "%.2f", "Stokes aerodinamik surtunme", nullptr, 0.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
+  {"Zemin Carpisma", "##p_coll", FieldType::Bool, offsetof(content::SceneEntity, particle_collision), sizeof(bool), 0.0f, 1.0f, 1.0f, nullptr, "Zemin duzlemine carpip sekme", nullptr, 0.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
+  {"Sekme Katsayisi", "##p_bnc", FieldType::Float, offsetof(content::SceneEntity, particle_bounce), sizeof(float), 0.0f, 1.0f, 0.05f, "%.2f", "Carpisma sonrasi enerji korunumu", nullptr, 0.6f, Vec2{0, 0}, Vec3{0, 0, 0}},
+  {"Olumde Alt-Parcacik", "##p_sub", FieldType::Int, offsetof(content::SceneEntity, particle_sub_on_death), sizeof(uint32_t), 0.0f, 50.0f, 1.0f, "%.0f", "Parcacik sonunde dogacak kivilcim sayisi", nullptr, 0.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
+  {"Kuyruk Izi", "##p_rib", FieldType::Bool, offsetof(content::SceneEntity, particle_ribbon), sizeof(bool), 0.0f, 1.0f, 1.0f, nullptr, "Serit seklinde kuyruk geometrisi", nullptr, 0.0f, Vec2{0, 0}, Vec3{0, 0, 0}},
 };
 
 // 11. ARAZİ (kSceneTerrain)
@@ -263,6 +270,7 @@ inline const ComponentMeta kComponentMetas[] = {
   {"Yetenek", "\xE2\x9A\xA1", content::kSceneAbility, kAbilityFields, sizeof(kAbilityFields)/sizeof(FieldMeta)},
   {"NavAgent", "\xE2\x9E\xA4", content::kSceneNavAgent, kNavAgentFields, sizeof(kNavAgentFields)/sizeof(FieldMeta)},
   {"Gokyuzu", "\xE2\x98\xBC", content::kSceneSkybox, nullptr, 0},
+  {"Envanter", "\xE2\x96\xA3", content::kSceneInventory, nullptr, 0},
 };
 inline constexpr size_t kComponentMetaCount = sizeof(kComponentMetas)/sizeof(ComponentMeta);
 

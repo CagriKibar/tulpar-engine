@@ -1,4 +1,5 @@
 #include "content/primitives.hpp"
+#include <cmath>
 
 namespace tulpar::engine::content {
 
@@ -19,6 +20,27 @@ uint32_t verts_used(const uint32_t *idx, uint32_t n) {
   for (uint32_t i = 0; i < n; i++)
     if (idx[i] + 1u > m) m = idx[i] + 1u;
   return m;
+}
+
+// Parcacik ve sis puflari icin kameraya donuk 20 segmentli dairesel disk.
+// Dortgen yerine dairesel geometri sayesinde opaktaki kare gorunum tamamen onlenir.
+uint32_t particle_disc(Vertex *v, uint32_t *idx, float radius, uint32_t seg) {
+  if (seg < 3) seg = 3;
+  const Vec3 n{0.0f, 0.0f, 1.0f};
+  uint32_t vi = 0, ii = 0;
+  const uint32_t center = vi;
+  v[vi++] = Vertex{Vec3{0.0f, 0.0f, 0.0f}, n, Vec2{0.5f, 0.5f}};
+  for (uint32_t c = 0; c <= seg; c++) {
+    const float th = 2.0f * 3.14159265358979323846f * (float)c / (float)seg;
+    const float cx = std::cos(th), sy = std::sin(th);
+    v[vi++] = Vertex{Vec3{cx * radius, sy * radius, 0.0f}, n, Vec2{0.5f + 0.5f * cx, 0.5f - 0.5f * sy}};
+  }
+  for (uint32_t c = 0; c < seg; c++) {
+    idx[ii++] = center;
+    idx[ii++] = center + 1 + c;
+    idx[ii++] = center + 2 + c;
+  }
+  return ii;
 }
 
 } // namespace
@@ -50,12 +72,8 @@ uint32_t build_primitive_meshes(renderer::Renderer &r, renderer::MeshHandle *out
     return out[slot];
   };
 
-  // Kup: parcacik yuvasiyla AYNI mesh'i paylasiyor — ayni geometri icin iki
-  // GPU tamponu ayirmanin anlami yok. Yuva 0'in dolu olmasi parcacik cizimini
-  // acan sey: eskiden hic doldurulmuyordu ve parcaciklar yayiliyor, simule
-  // ediliyor ama TEK PIKSEL cizilmiyordu (sessizce, 0 da gecerli bir indeks).
-  out[kPrimParticle] = make(kPrimCube, Renderer::cube(v, idx));
-
+  // Ilkel geometriler: kup, duzlem, kure, kapsul, silindir, koni, dortgen, simit.
+  make(kPrimCube, Renderer::cube(v, idx));
   make(kPrimPlane, Renderer::plane(v, idx));
   make(kPrimSphere, Renderer::sphere(v, idx));
   make(kPrimCapsule, Renderer::capsule(v, idx));
@@ -63,6 +81,8 @@ uint32_t build_primitive_meshes(renderer::Renderer &r, renderer::MeshHandle *out
   make(kPrimCone, Renderer::cone(v, idx));
   make(kPrimQuad, Renderer::quad(v, idx));
   make(kPrimTorus, Renderer::torus(v, idx));
+  // Parcacik ve sis ilkeli dairesel disk (20 segmentli); yumusak puf ve dairesel billboard.
+  make(kPrimParticle, particle_disc(v, idx, 0.5f, 20));
   return built;
 }
 

@@ -904,6 +904,32 @@ uint32_t editor_draw_gizmos(renderer::Renderer &ren, renderer::MeshHandle cube, 
     const float len = d.shadow_radius > 1.0f ? d.shadow_radius * 0.8f : 4.0f;
     draws += arrow(ren, cube, d.shadow_center, d.shadow_center + dir * len, {1.0f, 0.85f, 0.25f}, th * 1.5f);
   }
+  // Cevre hacimleri: yansima sondasi (IBL kure/kutu) ve yanki alani (Reverb kutu).
+  // Secili olmayanlar soluk cizilir (yarim kalinlik); secili olanlar altin/sari.
+  if (o.env_volumes) {
+    for (uint32_t i = 0; i < d.entity_count; i++) {
+      const content::SceneEntity &e = d.entities[i];
+      if (e.flags & content::kSceneHidden) continue;
+      bool is_sel = false;
+      for (uint32_t k = 0; k < n && !is_sel; k++) is_sel = sel && sel[k] == (int32_t)i;
+      if (e.components & content::kSceneRefProbe) {
+        const Mat4 m = content::scene_entity_world_matrix(d, i);
+        const Vec3 p{m.m[3][0], m.m[3][1], m.m[3][2]};
+        const float r = e.ref_probe_radius;
+        const Vec3 col = is_sel ? Vec3{1.0f, 0.95f, 0.4f} : Vec3{0.3f, 0.8f, 1.0f};
+        wire_box(ren, cube, p, {r, r, r}, col, is_sel ? th : th * 0.5f, &draws);
+      }
+      if (e.components & content::kSceneReverb) {
+        const Mat4 m = content::scene_entity_world_matrix(d, i);
+        const Vec3 p{m.m[3][0], m.m[3][1], m.m[3][2]};
+        const float rx = e.reverb_room_size * 10.0f;
+        const float ry = e.reverb_room_size * 6.0f;
+        const float rz = e.reverb_room_size * 10.0f;
+        const Vec3 col = is_sel ? Vec3{1.0f, 0.95f, 0.4f} : Vec3{1.0f, 0.6f, 0.2f};
+        wire_box(ren, cube, p, {rx, ry, rz}, col, is_sel ? th : th * 0.5f, &draws);
+      }
+    }
+  }
   return draws;
 }
 

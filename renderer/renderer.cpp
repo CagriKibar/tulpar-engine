@@ -1193,6 +1193,15 @@ bool Renderer::set_material_textures(MaterialHandle h, const PbrTextures &tex) {
 PbrTextures Renderer::material_textures(MaterialHandle h) const {
   return (h.valid() && h.id < material_count_) ? materials_[h.id].tex : PbrTextures{};
 }
+bool Renderer::set_material_albedo(MaterialHandle h, TextureHandle albedo) {
+  if (!h.valid() || h.id >= material_count_ || !albedo.valid() || albedo.id >= texture_count_) return false;
+  materials_[h.id].texture = albedo.id;
+  write_material_set(h.id);
+  return true;
+}
+TextureHandle Renderer::material_albedo(MaterialHandle h) const {
+  return (h.valid() && h.id < material_count_) ? TextureHandle{materials_[h.id].texture} : TextureHandle{};
+}
 PbrParams Renderer::material_pbr(MaterialHandle h) const {
   return (h.valid() && h.id < material_count_) ? materials_[h.id].pbr : PbrParams{};
 }
@@ -1673,6 +1682,15 @@ MeshHandle Renderer::create_mesh(const Vertex *verts, uint32_t nverts, const uin
   mesh_bounds(verts, nverts, &m.center, &m.radius);
   stats_.meshes = ++mesh_count_;
   return MeshHandle{mesh_count_ - 1};
+}
+
+bool Renderer::update_mesh_vertices(MeshHandle handle, const Vertex *verts, uint32_t nverts) {
+  if (!handle.valid() || handle.id >= mesh_count_) return false;
+  Mesh &m = meshes_[handle.id];
+  if (!m.vbuf || m.skinned) return false;
+  if (!upload_packed(m.vbuf, verts, nullptr, nverts)) return false;
+  mesh_bounds(verts, nverts, &m.center, &m.radius);
+  return true;
 }
 
 MeshHandle Renderer::create_skinned_mesh(const SkinnedVertex *verts, uint32_t nverts, const uint32_t *indices, uint32_t nindices) {

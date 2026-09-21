@@ -130,6 +130,9 @@ public:
   float aspect() const { return h_ ? (float)w_ / (float)h_ : 1.0f; }
   bool ok() const { return ok_; }
   const char *last_error() const { return err_; }
+  void set_clear_color(float r, float g, float b, float a = 1.0f) {
+    cfg_.clear[0] = r; cfg_.clear[1] = g; cfg_.clear[2] = b; cfg_.clear[3] = a;
+  }
 
   // Olcum: kac kez yeniden yaratildi / kac kez olcu istendi. Ikisi arasindaki
   // fark "gereksiz yeniden yaratma yok" iddiasinin KANITIDIR (kapi bunu olcer).

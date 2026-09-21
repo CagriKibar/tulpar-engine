@@ -122,7 +122,7 @@ def main():
             continue
         src = os.path.join(SHADERS, name)
         with open(src, "rb") as fh:
-            src_sha = hashlib.sha256(fh.read()).hexdigest()
+            src_sha = hashlib.sha256(fh.read().replace(b"\r\n", b"\n")).hexdigest()
         spv = compile_one(kind, exe, src, os.path.splitext(name)[1])
         if spv.returncode != 0:
             print(spv.stderr.decode(), file=sys.stderr)
