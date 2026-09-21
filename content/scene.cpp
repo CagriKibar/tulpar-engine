@@ -267,6 +267,15 @@ void write_entity(Out &o, const SceneEntity &e) {
     if (e.particle_gravity != kPd.particle_gravity || e.particle_billboard_type != kPd.particle_billboard_type) {
       o.puts("  partikul_fizik "); o.num(e.particle_gravity); o.ch(' '); o.num(e.particle_billboard_type); o.ch('\n');
     }
+    if (e.particle_curl_strength != kPd.particle_curl_strength || e.particle_curl_freq != kPd.particle_curl_freq ||
+        e.particle_drag != kPd.particle_drag || e.particle_collision != kPd.particle_collision ||
+        e.particle_bounce != kPd.particle_bounce || e.particle_sub_on_death != kPd.particle_sub_on_death ||
+        e.particle_ribbon != kPd.particle_ribbon) {
+      o.puts("  partikul_teps "); o.num(e.particle_curl_strength); o.ch(' '); o.num(e.particle_curl_freq); o.ch(' ');
+      o.num(e.particle_drag); o.ch(' '); o.num(e.particle_collision ? 1.0f : 0.0f); o.ch(' ');
+      o.num(e.particle_bounce); o.ch(' '); o.num((float)e.particle_sub_on_death); o.ch(' ');
+      o.num(e.particle_ribbon ? 1.0f : 0.0f); o.ch('\n');
+    }
   }
   if (e.components & kSceneTerrain) {
     o.puts("  arazi "); o.num(e.terrain_width); o.ch(' '); o.num(e.terrain_height); o.ch(' ');
@@ -360,7 +369,11 @@ bool scene_entity_equal(const SceneEntity &a, const SceneEntity &b) {
         !feq(a.particle_size_end, b.particle_size_end) || !veq(a.particle_velocity, b.particle_velocity) ||
         !veq(a.particle_jitter, b.particle_jitter) || !veq(a.particle_color_start, b.particle_color_start) ||
         !veq(a.particle_color_end, b.particle_color_end) || !feq(a.particle_gravity, b.particle_gravity) ||
-        a.particle_billboard_type != b.particle_billboard_type)
+        a.particle_billboard_type != b.particle_billboard_type ||
+        !feq(a.particle_curl_strength, b.particle_curl_strength) || !feq(a.particle_curl_freq, b.particle_curl_freq) ||
+        !feq(a.particle_drag, b.particle_drag) || a.particle_collision != b.particle_collision ||
+        !feq(a.particle_bounce, b.particle_bounce) || a.particle_sub_on_death != b.particle_sub_on_death ||
+        a.particle_ribbon != b.particle_ribbon)
       return false;
   }
 
@@ -426,7 +439,10 @@ bool scene_world_equal(const SceneWorld &a, const SceneWorld &b) {
          veq(a.cam_target, b.cam_target) && feq(a.cam_yaw, b.cam_yaw) && feq(a.cam_pitch, b.cam_pitch) && feq(a.cam_radius, b.cam_radius) &&
          a.godrays_enabled == b.godrays_enabled && feq(a.godray_density, b.godray_density) && feq(a.godray_weight, b.godray_weight) &&
          feq(a.godray_decay, b.godray_decay) && feq(a.godray_exposure, b.godray_exposure) && feq(a.time_of_day, b.time_of_day) &&
-         feq(a.sky_turbidity, b.sky_turbidity);
+         feq(a.sky_turbidity, b.sky_turbidity) &&
+         a.fog_enabled == b.fog_enabled && a.fog_type == b.fog_type && feq(a.fog_density, b.fog_density) &&
+         feq(a.fog_start, b.fog_start) && feq(a.fog_end, b.fog_end) && feq(a.fog_height_falloff, b.fog_height_falloff) &&
+         feq(a.fog_base_height, b.fog_base_height) && veq(a.fog_color, b.fog_color) && feq(a.fog_scattering, b.fog_scattering);
 }
 
 
@@ -494,6 +510,16 @@ size_t scene_write(const SceneDesc &d, char *buf, size_t cap) {
     }
     if (d.time_of_day != kWd.time_of_day || d.sky_turbidity != kWd.sky_turbidity) {
       o.puts("zaman "); o.num(d.time_of_day); o.ch(' '); o.num(d.sky_turbidity); o.ch('\n');
+    }
+    if (d.fog_enabled != kWd.fog_enabled || d.fog_type != kWd.fog_type || d.fog_density != kWd.fog_density ||
+        d.fog_start != kWd.fog_start || d.fog_end != kWd.fog_end || d.fog_height_falloff != kWd.fog_height_falloff ||
+        d.fog_base_height != kWd.fog_base_height || d.fog_color.x != kWd.fog_color.x || d.fog_color.y != kWd.fog_color.y ||
+        d.fog_color.z != kWd.fog_color.z || d.fog_scattering != kWd.fog_scattering) {
+      o.puts("sis "); o.puts(d.fog_enabled ? "acik " : "kapali ");
+      o.num((float)d.fog_type); o.ch(' '); o.num(d.fog_density); o.ch(' ');
+      o.num(d.fog_start); o.ch(' '); o.num(d.fog_end); o.ch(' ');
+      o.num(d.fog_height_falloff); o.ch(' '); o.num(d.fog_base_height); o.ch(' ');
+      o.vec(d.fog_color); o.ch(' '); o.num(d.fog_scattering); o.ch('\n');
     }
   }
   for (uint32_t i = 0; i < d.asset_count; i++) { o.puts("kaynak "); o.str(d.assets[i]); o.ch('\n'); }
@@ -645,6 +671,17 @@ bool scene_parse(const char *text, size_t len, SceneDesc *out, SceneError *err) 
       } else if ((seen_comp & kSceneParticle) && tok_is(t[0], "partikul_fizik")) {
         if (n != 3) return p.fail("partikul_fizik yercekimi billboard");
         if (!p.num(t[1], &cur.particle_gravity) || !p.uint(t[2], &cur.particle_billboard_type)) return false;
+      } else if ((seen_comp & kSceneParticle) && tok_is(t[0], "partikul_teps")) {
+        if (n != 8) return p.fail("partikul_teps curl_str curl_freq drag coll bounce sub ribbon");
+        float coll = 0.0f, sub = 0.0f, rib = 0.0f;
+        if (!p.num(t[1], &cur.particle_curl_strength) || !p.num(t[2], &cur.particle_curl_freq) ||
+            !p.num(t[3], &cur.particle_drag) || !p.num(t[4], &coll) ||
+            !p.num(t[5], &cur.particle_bounce) || !p.num(t[6], &sub) ||
+            !p.num(t[7], &rib))
+          return false;
+        cur.particle_collision = (coll > 0.5f);
+        cur.particle_sub_on_death = (uint32_t)sub;
+        cur.particle_ribbon = (rib > 0.5f);
       } else if ((seen_comp & kSceneParticle) && tok_is(t[0], "omur")) {
         // --- Cok satirli partikul yaziminin devam satirlari. YAZICI bunlari
         // URETMEZ (tek satir yazar); yalniz okunurlar ki o bicimde yazilmis
@@ -836,6 +873,15 @@ bool scene_parse(const char *text, size_t len, SceneDesc *out, SceneError *err) 
     } else if (tok_is(t[0], "zaman")) {
       if (n != 3) return p.fail("zaman saat bulaniklik");
       if (!p.num(t[1], &out->time_of_day) || !p.num(t[2], &out->sky_turbidity)) return false;
+    } else if (tok_is(t[0], "sis")) {
+      if (n != 12) return p.fail("sis acik|kapali tur yogunluk basla bitir yukseklik taban r g b sacilim");
+      out->fog_enabled = tok_is(t[1], "acik");
+      float ftype = 0;
+      if (!p.num(t[2], &ftype) || !p.num(t[3], &out->fog_density) ||
+          !p.num(t[4], &out->fog_start) || !p.num(t[5], &out->fog_end) ||
+          !p.num(t[6], &out->fog_height_falloff) || !p.num(t[7], &out->fog_base_height) ||
+          !p.vec(t + 8, &out->fog_color) || !p.num(t[11], &out->fog_scattering)) return false;
+      out->fog_type = (uint32_t)ftype;
     } else if (tok_is(t[0], "son")) return p.fail("'son' varlik disinda");
     else return p.fail("bilinmeyen anahtar");
   }
@@ -1127,6 +1173,16 @@ SceneBounds scene_entity_local_bounds(const SceneEntity &e, const SceneBounds *m
   }
   if (e.components & kSceneTerrain) {
     grow({0.0f, 0.0f, 0.0f}, {e.terrain_width * e.terrain_cell, e.terrain_amp, e.terrain_height * e.terrain_cell});
+  }
+  if (e.components & kSceneRefProbe) {
+    const float r = e.ref_probe_radius;
+    grow({-r, -r, -r}, {r, r, r});
+  }
+  if (e.components & kSceneReverb) {
+    const float rx = e.reverb_room_size * 10.0f;
+    const float ry = e.reverb_room_size * 6.0f;
+    const float rz = e.reverb_room_size * 10.0f;
+    grow({-rx, -ry, -rz}, {rx, ry, rz});
   }
   return b;
 }

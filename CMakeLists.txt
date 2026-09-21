@@ -426,7 +426,7 @@ if(NOT ANDROID)
     target_compile_options(engine_clodbake PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${ENGINE_CXX_OPTS}>)
     # --- engine_editor: motor duzenleme kipinde (ImGui paneller + ImGuizmo), masaustu / headless
     add_executable(engine_editor app/editor.cpp app/editor_app.cpp app/editor_ui.cpp app/editor_viewport.cpp app/editor_commands.cpp app/editor_layout.cpp app/editor_chrome.cpp app/editor_widgets.cpp app/editor_multiedit.cpp app/editor_overlay.cpp app/editor_camera.cpp app/editor_console.cpp app/editor_files.cpp app/demo_scene.cpp)
-    target_link_libraries(engine_editor PRIVATE engine_content engine_renderer engine_sim engine_rhi engine_core engine_imgui ${CMAKE_DL_LIBS})
+    target_link_libraries(engine_editor PRIVATE engine_content engine_renderer engine_sim engine_audio engine_rhi engine_core engine_imgui ${CMAKE_DL_LIBS})
     if(WIN32)
         # psapi: durum cubugundaki RSS sayaci (GetProcessMemoryInfo). /proc yok.
         target_link_libraries(engine_editor PRIVATE psapi)

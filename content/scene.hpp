@@ -155,6 +155,13 @@ struct SceneEntity {
   Vec3 particle_color_end{0.2f, 0.2f, 0.2f};   // bitis rengi (duman/gri)
   float particle_gravity = -2.0f;              // yercekimi ivmesi (m/s^2)
   uint32_t particle_billboard_type = 0;        // 0: Screen-aligned, 1: Stretched/Velocity, 2: Horizontal
+  float particle_curl_strength = 0.0f;         // curl noise turbulans siddeti (m/s^2)
+  float particle_curl_freq = 1.0f;             // turbulans frekansi (1/m)
+  float particle_drag = 0.0f;                  // stokes aerodinamik hava direnci
+  bool particle_collision = false;             // zemin carpisma/sekme aktif
+  float particle_bounce = 0.6f;                // carpisma sekme katsayisi (restitution)
+  uint32_t particle_sub_on_death = 0;          // olum aninda alt parcacik patlama sayisi
+  bool particle_ribbon = false;                // serit / kuyruk izi
   // yapay zeka (kSceneNavAgent)
   Vec3 ai_target{0, 0, 0};
   float ai_speed = 3.0f;
@@ -224,6 +231,16 @@ struct SceneWorld {
   // Atmosfer & 24 Saat Gunes Dongusu
   float time_of_day = 14.0f;     // 14:00 (saat)
   float sky_turbidity = 2.5f;    // atmosfer bulanikligi
+  // --- 16 Sis Türü ve Atmosferik Hacimler (docs/SIS_VE_HACIMSEL_ATMOSFER_MIMARISI.md)
+  bool     fog_enabled = false;
+  uint32_t fog_type = 3;              // 0: Doğrusal, 1: Üstel, 2: Exp², 3: Yükseklik Sisi (Inigo Quilez), 4: Çift Kademeli UE5, 5: Toksik/Mistik
+  float    fog_density = 0.015f;      // Temel sis yoğunluğu
+  float    fog_start = 5.0f;          // Doğrusal başlangıç mesafesi
+  float    fog_end = 120.0f;          // Doğrusal bitiş mesafesi
+  float    fog_height_falloff = 0.08f;// Yükseklik sönümlenme katsayısı lambda
+  float    fog_base_height = 0.0f;    // Sis taban zemin kotu y0
+  Vec3     fog_color{0.7f, 0.76f, 0.84f}; // Atmosferik sis rengi
+  float    fog_scattering = 0.5f;     // Güneş ışığı saçılım çarpanı (Mie)
 };
 
 bool scene_world_equal(const SceneWorld &a, const SceneWorld &b); // bit-tam

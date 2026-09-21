@@ -88,6 +88,34 @@ renderer::MeshHandle make_terrain_mesh(Arena &tmp, renderer::Renderer &r, const 
   return r.create_mesh(verts, nverts, indices, nindices);
 }
 
+bool update_terrain_mesh_vertices(Arena &tmp, renderer::Renderer &r, renderer::MeshHandle mesh, const HeightmapConfig &cfg, const float *deltas) {
+  if (cfg.width < 2 || cfg.height < 2 || !mesh.valid()) return false;
+  const uint32_t nverts = cfg.width * cfg.height;
+  float *heights = tmp.alloc_array<float>(nverts);
+  renderer::Vertex *verts = tmp.alloc_array<renderer::Vertex>(nverts);
+  if (!heights || !verts) return false;
+  generate_heightmap(cfg, heights);
+  if (deltas) {
+    for (uint32_t j = 0; j < nverts; j++) heights[j] += deltas[j];
+  }
+  for (uint32_t z = 0; z < cfg.height; z++) {
+    for (uint32_t x = 0; x < cfg.width; x++) {
+      const uint32_t i = z * cfg.width + x;
+      verts[i].pos = {(float)x * cfg.cell_size, heights[i], (float)z * cfg.cell_size};
+      verts[i].uv = {(float)x / (float)(cfg.width - 1), (float)z / (float)(cfg.height - 1)};
+      verts[i].nrm = {0, 1, 0};
+    }
+  }
+  for (uint32_t z = 1; z + 1 < cfg.height; z++) {
+    for (uint32_t x = 1; x + 1 < cfg.width; x++) {
+      const float hl = heights[z * cfg.width + x - 1], hr = heights[z * cfg.width + x + 1];
+      const float hd = heights[(z - 1) * cfg.width + x], hu = heights[(z + 1) * cfg.width + x];
+      verts[z * cfg.width + x].nrm = normalize(Vec3{hl - hr, 2.0f * cfg.cell_size, hd - hu});
+    }
+  }
+  return r.update_mesh_vertices(mesh, verts, nverts);
+}
+
 // UYARI: blob'da voksel HUCRELERI yok, yalniz izgara boyu + hucre kenari
 // (SceneBlobVoxel). Yani bu bir YER TUTUCU dolgu (izgaraya sigan kure) —
 // gercek voksel verisi bicime girdiginde burasi onu okuyacak. Yer tutucu
@@ -434,7 +462,7 @@ void SceneRuntime::draw(renderer::Renderer &r, Vec3 cam_pos, float time_s, const
   if (prims_[kPrimParticle].valid()) {
     for (uint32_t i = 0; i < particles_.alive_count(); i++) {
       const Particle &p = particles_.particle(i);
-      r.draw(prims_[kPrimParticle], Mat4::translate(p.pos) * Mat4::scale({p.size, p.size, p.size}), Vec3{0.9f, 0.9f, 0.9f});
+      r.draw(prims_[kPrimParticle], Mat4::translate(p.pos) * Mat4::scale({p.size, p.size, p.size}), particles_.color(i));
       stats_.draws++;
     }
   }

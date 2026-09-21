@@ -373,6 +373,7 @@ public:
   // Yukleme: staging ile device-local. Kare icinde CAGRILMAZ.
   MeshHandle create_mesh(const Vertex *verts, uint32_t nverts, const uint32_t *indices, uint32_t nindices);
   MeshHandle create_skinned_mesh(const SkinnedVertex *verts, uint32_t nverts, const uint32_t *indices, uint32_t nindices);
+  bool update_mesh_vertices(MeshHandle handle, const Vertex *verts, uint32_t nverts);
   // Indeks araligi seyrek (Mali kurali, CPU'da olculur) mesh sayisi; kapi 0 bekler.
   uint32_t sparse_mesh_count() const { return sparse_mesh_count_; }
   // RGBA8, mip zinciri blit ile uretilir (yukleme aninda). Mobil asil yol ASTC (Faz 6).
@@ -391,6 +392,8 @@ public:
   // Dokulari yerinde degistirir (descriptor yazimi + UBO maskesi). KARE DISINDA.
   bool set_material_textures(MaterialHandle m, const PbrTextures &tex);
   PbrTextures material_textures(MaterialHandle m) const;
+  bool set_material_albedo(MaterialHandle m, TextureHandle albedo);
+  TextureHandle material_albedo(MaterialHandle m) const;
   // OLCUM: set 1'in baglama sayisi ve malzeme UBO'sunun cihaz hizasina
   // yuvarlanmis adim boyu. Butce kapisi bunlari basar (once/sonra karsilastirma).
   static constexpr uint32_t kMaterialBindings = 5; // albedo, UBO, ORM, normal, isima
@@ -492,6 +495,7 @@ public:
     cfg_.bloom_radius = radius;
   }
   void set_exposure(float e) { cfg_.exposure = e; }
+  void set_post_clear(const Vec3 &c) { cfg_.post_clear = c; }
 
   // --- Faz 5: zamansal (jitter / MV / dinamik cozunurluk / upscaler) -------
   TemporalInfo temporal() const { return temporal_; }

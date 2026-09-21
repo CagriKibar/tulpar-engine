@@ -69,3 +69,60 @@ ENGINE_TEST(fbm_multi_octave_stays_in_unit_range) {
     CHECK(v >= 0.0f && v < 1.0f);
   }
 }
+
+ENGINE_TEST(value_noise_3d_matches_lattice_hash_at_integer_points) {
+  CHECK(value_noise_3d(2.0f, 3.0f, 5.0f, 42u) == lattice_hash_3d(2, 3, 5, 42u));
+  CHECK(value_noise_3d(0.0f, 0.0f, 0.0f, 17u) == lattice_hash_3d(0, 0, 0, 17u));
+  CHECK(value_noise_3d(-4.0f, 1.0f, -6.0f, 99u) == lattice_hash_3d(-4, 1, -6, 99u));
+}
+
+ENGINE_TEST(value_noise_3d_stays_in_unit_range) {
+  Rng r(777);
+  for (int i = 0; i < 300; i++) {
+    float x = (r.next_float() - 0.5f) * 100.0f;
+    float y = (r.next_float() - 0.5f) * 100.0f;
+    float z = (r.next_float() - 0.5f) * 100.0f;
+    float v = value_noise_3d(x, y, z, 1234u);
+    CHECK(v >= 0.0f && v < 1.0f);
+  }
+}
+
+ENGINE_TEST(fbm_3d_single_octave_matches_value_noise_3d) {
+  Vec3 p{3.25f, -1.75f, 4.5f};
+  float a = fbm_3d(p, 88u, 1);
+  float b = value_noise_3d(p.x, p.y, p.z, 88u);
+  CHECK(a == b);
+}
+
+ENGINE_TEST(curl_noise_3d_is_divergence_free) {
+  // div(v) = dvx/dx + dvy/dy + dvz/dz
+  // Karisik kismi turevlerin sayisal simetrisi: curl hesabi ve div hesabi
+  // ayni adim boyu (h) ile yapildiginda nabla . (nabla x A) tam olarak birbirini goturur.
+  const float h = 0.01f;
+  const float inv_2h = 1.0f / (2.0f * h);
+  Rng r(456);
+
+  for (int i = 0; i < 20; i++) {
+    Vec3 p{
+      (r.next_float() - 0.5f) * 20.0f,
+      (r.next_float() - 0.5f) * 20.0f,
+      (r.next_float() - 0.5f) * 20.0f
+    };
+
+    Vec3 vx_plus = curl_noise_3d({p.x + h, p.y, p.z}, 42u, 2, h);
+    Vec3 vx_minus = curl_noise_3d({p.x - h, p.y, p.z}, 42u, 2, h);
+    float dvx_dx = (vx_plus.x - vx_minus.x) * inv_2h;
+
+    Vec3 vy_plus = curl_noise_3d({p.x, p.y + h, p.z}, 42u, 2, h);
+    Vec3 vy_minus = curl_noise_3d({p.x, p.y - h, p.z}, 42u, 2, h);
+    float dvy_dy = (vy_plus.y - vy_minus.y) * inv_2h;
+
+    Vec3 vz_plus = curl_noise_3d({p.x, p.y, p.z + h}, 42u, 2, h);
+    Vec3 vz_minus = curl_noise_3d({p.x, p.y, p.z - h}, 42u, 2, h);
+    float dvz_dz = (vz_plus.z - vz_minus.z) * inv_2h;
+
+    float div = dvx_dx + dvy_dy + dvz_dz;
+    CHECK(std::fabs(div) < 1e-4f);
+  }
+}
+

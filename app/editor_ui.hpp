@@ -213,6 +213,7 @@ struct GizmoOptions {
   bool shadow_volume = true;   // Dunya panelindeki golge hacmi (tel kutu)
   bool sun_dir = true;         // gunes yonu (ok; isiga dogru)
   bool camera_frustum = true;  // kamera varliklarinin govdesi + gorus alani (tel kafes)
+  bool env_volumes = true;     // cevre hacimleri: yansima sondasi (IBL) + yanki alani (Reverb)
   float thickness = 0.06f;     // tel kalinligi (dunya birimi)
 };
 // Donus: yapilan ren.draw cagrisi sayisi (secili isik daha parlak cizilir).

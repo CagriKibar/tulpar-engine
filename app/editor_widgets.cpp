@@ -582,6 +582,7 @@ int component_add_button(const char *const *names, uint32_t count) {
 // fontta yok -- menude tofu kutusu cizerdi, kullanilmaz.
 const CreateMenuItem kCompModel[] = {
     {"Model (glTF)", "\xE2\x97\x86", content::kSceneModel, nullptr, 0}, // ◆
+    {"Malzeme (PBR)", ICON_MD_COLOR_LENS, content::kSceneModel, nullptr, 0},
     {"Animasyon", "\xE2\x86\xBB", content::kSceneAnim, nullptr, 0},     // ↻
 };
 const CreateMenuItem kCompLight[] = {
@@ -602,10 +603,6 @@ const CreateMenuItem kCompAudio[] = {
 const CreateMenuItem kCompScript[] = {
     {"Tulpar Betik", ICON_MD_DESCRIPTION, content::kSceneScript, nullptr, 0},
 };
-const CreateMenuItem kCompVFX[] = {
-    {"Partik\xC3\xBCl Emitter", ICON_MD_AUTO_AWESOME, content::kSceneParticle, nullptr, 0},
-    {"R\xC3\xBCzgar Alan\xC4\xB1", "\xE2\x86\xAF", content::kSceneWind, nullptr, 0}, // ↯
-};
 const CreateMenuItem kCompEnvironment[] = {
     {"Arazi (Terrain)", ICON_MD_TERRAIN, content::kSceneTerrain, nullptr, 0},
     {"Su (Gerstner)", ICON_MD_WATER, content::kSceneWater, nullptr, 0},
@@ -617,6 +614,7 @@ const CreateMenuItem kCompEnvironment[] = {
     // (gunun saati, turbidite) tasiyor.
     {"G\xC3\xB6ky\xC3\xBCz\xC3\xBC & Atmosfer (Skybox)", ICON_MD_CLOUD, content::kSceneSkybox, nullptr, 0},
     {"Yans\xC4\xB1ma Sondas\xC4\xB1 (Probe)", ICON_MD_LENS, content::kSceneRefProbe, nullptr, 0},
+    {"R\xC3\xBCzgar Alan\xC4\xB1", "\xE2\x86\xAF", content::kSceneWind, nullptr, 0}, // ↯
 };
 const CreateMenuItem kCompAI[] = {
     {"Yapay Zeka Ajan\xC4\xB1 (NavAgent)", ICON_MD_DIRECTIONS_RUN, content::kSceneNavAgent, nullptr, 0},
@@ -629,10 +627,13 @@ const CreateMenuItem kCompGameplay[] = {
     // ▣ (U+25A3): Kutu (Envanter cantasi gibi)
     {"Envanter", "\xE2\x96\xA3", content::kSceneInventory, nullptr, 0},
 };
+const CreateMenuItem kCompVFX[] = {
+    {"Partik\xC3\xBCl / VFX Yay\xC4\xB1""c\xC4\xB1", "\xE2\x88\xB4", content::kSceneParticle, nullptr, 0},
+};
 const CreateMenuItem kComponentMenu[] = {
-    {"Render", nullptr, 0, kCompModel, 2},
-    {"VFX", nullptr, 0, kCompVFX, 2},
-    {"\xC3\x87" "evre (Environment)", nullptr, 0, kCompEnvironment, 5},
+    {"Render", nullptr, 0, kCompModel, 3},
+    {"G\xC3\xB6rsel Efektler (VFX)", nullptr, 0, kCompVFX, 1},
+    {"\xC3\x87" "evre (Environment)", nullptr, 0, kCompEnvironment, 6},
     {"I\xC5\x9F\xC4\xB1k", nullptr, 0, kCompLight, 1},
     {"Fizik", nullptr, 0, kCompPhysics, 3},
     {"Kamera", nullptr, 0, kCompCamera, 1},
@@ -641,7 +642,7 @@ const CreateMenuItem kComponentMenu[] = {
     {"Yapay Zeka (AI)", nullptr, 0, kCompAI, 1},
     {"Oynan\xC4\xB1\xC5\x9F (Gameplay)", nullptr, 0, kCompGameplay, 3},
 };
-const uint32_t kComponentMenuCount = 10;
+const uint32_t kComponentMenuCount = (uint32_t)(sizeof(kComponentMenu) / sizeof(kComponentMenu[0]));
 
 namespace {
 
@@ -773,7 +774,14 @@ const CreateMenuItem kCreateEnvironment[] = {
     {"R\xC3\xBCzgar Alan\xC4\xB1", "\xE2\x86\xAF", 34, nullptr, 0},                    // ↯
 };
 const CreateMenuItem kCreateVolumes[] = {
-    {"Hacimsel Sis Hacmi (Fog Volume)", "\xE2\x96\xA8", 46, nullptr, 0},
+    {"3B Hacimsel Sis (K\xC3\xBCre Puf / Fog Volume)", ICON_MD_CLOUD, 46, nullptr, 0},
+    {"Yatay Zemin Sisi (Ground Mist Sheet)", "\xE2\x96\xAC", 70, nullptr, 0},
+    {"Konik Baca Sisi / Duman Jeti (Cone Fog)", "\xE2\x96\xBC", 71, nullptr, 0},
+    {"Silindirik Kuyu / \xC5\x9E""aft Sisi (Cylinder Fog)", "\xE2\x95\x91", 72, nullptr, 0},
+    {"Portal / Halka Sisi (Torus Ring Fog)", "\xE2\x97\x8E", 73, nullptr, 0},
+    {"Voksel Duman / CS2 Dinamik Sis (Voxel Smoke)", ICON_MD_BLUR_ON, 74, nullptr, 0},
+    {"Tetikleyici Hacim (Trigger Volume)", "\xE2\x97\xA3", 47, nullptr, 0},
+    {"Engelleme Hacmi (Blocking Volume)", "\xE2\x96\xA3", 48, nullptr, 0},
     {"Yans\xC4\xB1ma Sondas\xC4\xB1 (Probe)", "\xE2\x97\x89", 37, nullptr, 0},
     {"I\xC5\x9F\xC4\xB1k Hacmi Sondas\xC4\xB1 (GI Grid)", "\xE2\x97\x87", 45, nullptr, 0},
     {"Yank\xC4\xB1 Alan\xC4\xB1 (Reverb)", "\xE2\x97\x8E", 44, nullptr, 0},
@@ -782,7 +790,10 @@ const CreateMenuItem kCreateVFX[] = {
     {"Yang\xC4\xB1n & Ate\xC5\x9F (Fire & Embers)", "\xE2\x9A\xA1", 35, nullptr, 0},
     {"Duman & Toz (Smoke & Dust)", "\xE2\x96\x91", 60, nullptr, 0},
     {"K\xC4\xB1v\xC4\xB1lc\xC4\xB1m & \xC3\x87" "arp\xC4\xB1\xC5\x9Fma (Sparks)", "\xE2\x9A\xA1", 61, nullptr, 0},
-    {"Ya\xC4\x9Fmur & Kar (Precipitation)", "\xE2\x98\x94", 62, nullptr, 0},
+    {"Ya\xC4\x9Fmur & F\xC4\xB1rt\xC4\xB1na (Rain & Storm)", "\xE2\x98\x94", 62, nullptr, 0},
+    {"Kar & Tipi (Snow & Blizzard)", "\xE2\x97\x8B", 66, nullptr, 0},
+    {"B\xC3\xBCy\xC3\xBC & I\xC5\x9F\xC4\xB1lt\xC4\xB1 (Magic Glow)", "\xE2\x9C\xA6", 67, nullptr, 0},
+    {"\xC3\x96zel Partik\xC3\xBCl Emitter (Custom)", "\xE2\x88\xB4", 68, nullptr, 0},
 };
 const CreateMenuItem kCreatePhysics[] = {
     {"Sabit Kutu G\xC3\xB6vde", "\xE2\x96\xA1", 4, nullptr, 0},    // □
